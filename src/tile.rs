@@ -123,7 +123,7 @@ impl TileManager {
         if let Some(data) = cg.file.load(coord) {
             return Ok(Tile { data, mtime: cg.file.mtime(coord) });
         }
-        let tiles = self.create_meta(cg, &meta, true).await?;
+        let (tiles, _) = self.create_meta(cg, &meta, true).await?;
         tiles
             .into_iter()
             .find(|(c, _)| *c == coord)
@@ -132,8 +132,8 @@ impl TileManager {
     }
 
     /// Render a metatile and (if all sources succeeded and `store`) write all its tiles.
-    /// Returns the encoded tiles.
-    pub async fn create_meta(&self, cg: &Arc<CacheGrid>, meta: &MetaTile, store: bool) -> Result<Vec<(TileCoord, Vec<u8>)>> {
+    /// Returns the encoded tiles and whether they were stored.
+    pub async fn create_meta(&self, cg: &Arc<CacheGrid>, meta: &MetaTile, store: bool) -> Result<(Vec<(TileCoord, Vec<u8>)>, bool)> {
         let t0 = std::time::Instant::now();
         let srs = &cg.meta.grid.srs;
         let size = meta.size;
@@ -208,7 +208,7 @@ impl TileManager {
             t_fetch,
             t0.elapsed()
         );
-        Ok(encoded.into_iter().map(|(c, d, _)| (c, d)).collect())
+        Ok((encoded.into_iter().map(|(c, d, _)| (c, d)).collect(), store && cacheable))
     }
 }
 

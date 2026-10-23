@@ -368,14 +368,17 @@ impl Counters {
     fn record(&mut self, r: Finished, task: &SeedTask, total: usize, progress: &mut Option<Progress>) -> (usize, TileCoord) {
         let (i, z, main, r) = r;
         match r {
-            Ok(n) => self.tiles += n,
+            Ok(n) => {
+                self.tiles += n;
+                // Only a contiguous prefix of successful metatiles can be resumed safely;
+                // a failed one keeps the resume point before it.
+                self.finished.insert(i);
+            }
             Err(e) => {
                 self.errors += 1;
                 eprintln!("error in metatile {main:?}: {e:#}");
             }
         }
-        // Only a contiguous prefix of finished metatiles can be resumed safely.
-        self.finished.insert(i);
         while self.finished.remove(&self.prefix) {
             self.prefix += 1;
         }
@@ -465,7 +468,13 @@ pub async fn run(mgr: Arc<TileManager>, tasks: Vec<SeedTask>, mode: Mode, concur
                     let lock_cg = t.cg.clone();
                     async {
                         let _l = tokio::task::spawn_blocking(move || lock_cg.file.lock(main)).await??;
-                        m.create_meta(&t.cg, &meta, true).await.map(|t| t.len())
+                        // A source error (on_error: transparent) leaves the metatile unstored:
+                        // MapProxy's seeder counts that as done; here it is an error, so it shows
+                        // in the summary/exit code and the resume point stays before it.
+                        match m.create_meta(&t.cg, &meta, true).await? {
+                            (tiles, true) => Ok(tiles.len()),
+                            (_, false) => Err(anyhow!("not stored: a source failed (see the warnings above)")),
+                        }
                     }
                     .await
                 };

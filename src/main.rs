@@ -97,7 +97,7 @@ fn main() -> Result<()> {
             let data = rt.block_on(async {
                 if has("--no-store") {
                     let meta = cg.meta.meta_tile(coord);
-                    let tiles = mgr.create_meta(&cg, &meta, false).await?;
+                    let (tiles, _) = mgr.create_meta(&cg, &meta, false).await?;
                     tiles.into_iter().find(|(c, _)| *c == coord).map(|(_, d)| d).ok_or_else(|| anyhow!("tile not in metatile"))
                 } else {
                     Ok(mgr.tile(&cg, coord).await?.data)
