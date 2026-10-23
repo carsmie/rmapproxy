@@ -1,0 +1,2 @@
+composite_*.png: generated with Pillow 10.2.0: 256x256, x = source alpha, y = destination alpha,
+random RGB (seed 1); composite_out = Image.alpha_composite(dst, src).
