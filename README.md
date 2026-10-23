@@ -23,37 +23,43 @@ source URL and per-metatile timings.
 ## Status (2026-10-23)
 
 Verified against MapProxy 7.0 (tnt-mapproxy image) on the same rendered config and the
-same local rGIS: Oslo, `topo_cache`, z6–13, 816 tiles.
+same local rGIS, Oslo box, `-c 4`, 4 dedicated cores:
 
 | | MapProxy 7.0 | rMapproxy |
 |---|---|---|
-| Tiles, files, single-colour hardlinks | 816 / 817 / 2 | identical set |
-| Pixels | reference | **817 / 817 identical** |
-| Wall time, `-c 4`, 4 dedicated cores | 107.9 s | 13.7–14.7 s |
-| CPU (user + sys) | 121.5 s | 36–43 s |
-| Peak RSS | 249 MB | 650 MB |
+| `topo_cache` z6–13, 816 tiles | reference | **817 / 817 files pixel-identical** |
+| — wall / CPU | 107.9 s / 121.5 s | 13.7–16.5 s / 36 s |
+| `topo_cache_2x` z6–12 (mediancut PNG8), 200 tiles | reference | **200 / 200 pixel-identical, same PLTE/tRNS** |
+| — wall / CPU | 79.5 s / 146.6 s | 14.8 s / 40 s |
+| Peak RSS (`-c 4` / `-c 16`) | 249 MB / – | 166–216 MB / 386–509 MB |
 
 Why it's faster: the 33 sources of a metatile are fetched concurrently (MapProxy: one
 after another), compositing is a table-driven port of Pillow's integer `alpha_composite`
-with exact fast paths, tiles are encoded in parallel.
+with exact fast paths, tiles are encoded in parallel. Source responses stay encoded until
+their turn in the merge, so memory stays at about one decoded layer per metatile.
 
 Done: config subset (base includes, merge keys, grids incl. `base:`), grid/metatile
 geometry, coverages (bbox + GeoJSON polygons, strict/shapely intersect semantics),
 resolution ranges, coverage sub-requests, `on_error` transparent/uncached, Pillow-exact
-merge, `tc` file cache with atomic writes, single-colour hardlinks and MapProxy-compatible
-flock files, WMTS GetTile KVP + REST + GetCapabilities, CORS/cache headers, seeding
-(TileWalker order, coverage, levels, refresh_before / overwrite-all, `-c`).
+merge, Pillow's median-cut quantizer (Quant.c port, incl. MapProxy's 1-bit alpha handling),
+`tc` file cache with atomic writes, single-colour hardlinks and MapProxy-compatible flock
+files, WMTS GetTile KVP + REST + GetCapabilities, CORS/cache headers, seeding (TileWalker
+order, coverage, levels, refresh_before / overwrite-all, `-c`), `--cleanup` (incl. complete
+extent), `--progress-file` (pickle readable by tnt-mapproxy's admin) + `--continue`. Invoked
+as `mapproxy-seed` it behaves as the seed command. Static musl `Dockerfile` (rustls).
+
+Note: MapProxy's mediancut path marks transparent pixels as palette index 255, which lies
+outside the written palette/tRNS (or gets truncated to a lower bit depth), so those pixels
+decode as opaque black. rMapproxy reproduces that byte for byte (parity); fixing it would
+change tiles relative to MapProxy.
 
 ## Not yet
 
-1. **Paletted PNG** (`image.colors`, `encoding_options.quantizer`): `topo_cache_2x`
-   (mediancut) and `qgis_hoydekurve_cache` are written as RGBA for now (warning logged).
-   Needs a port of Pillow's quantizers (libImaging/Quant.c) for pixel parity.
-2. Seeding: `--continue` / `--progress-file` (resume), `--cleanup`, `refresh_before.time/mtime`,
-   progress percentages matching mapproxy-seed's.
-3. Peak memory: decoded source images of all in-flight metatiles are held; decode into the
-   composite incrementally or bound concurrency by megapixels.
-4. Reprojection for `utm32n` / `utm35n` (those cache/grid pairs are skipped and not
-   advertised); WMS service; legends.
-5. Packaging: Dockerfile, the admin app calling `rmapproxy seed`, a tnt-apps deployment
-   next to MapProxy for an A/B on dev.
+1. `fastoctree` quantizer (MapProxy's default, only `qgis_hoydekurve_cache` uses it): written
+   as RGBA with a warning.
+2. Reprojection for `utm32n` / `utm35n` (those cache/grid pairs are skipped and not
+   advertised); WMS service; legends; the admin GUI (stays in tnt-mapproxy).
+3. Seeding: `refresh_before.time/mtime`, multiple coverages per task.
+
+Deployment: [kartverket/tnt-rmapproxy](https://github.com/kartverket/tnt-rmapproxy) builds a
+pinned commit of this repository with tnt-mapproxy's configuration.

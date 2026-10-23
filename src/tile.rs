@@ -149,9 +149,18 @@ impl TileManager {
         while let Some((s, r)) = stream.next().await {
             match r.with_context(|| format!("source {}", s.conf.name))? {
                 SourceImage::Skip => {}
-                SourceImage::Image { img, mode, cacheable: c } => {
-                    cacheable &= c;
-                    merger.add(img, mode);
+                SourceImage::Transparent => {
+                    cacheable = false;
+                    merger.add_transparent();
+                }
+                SourceImage::Png { data, size: sub, place } => {
+                    // Decode + composite on this worker without stalling the runtime.
+                    tokio::task::block_in_place(|| -> Result<()> {
+                        let (img, mode) = SourceImage::decode(&data, sub, place, size)
+                            .with_context(|| format!("source {}", s.conf.name))?;
+                        merger.add(img, mode);
+                        Ok(())
+                    })?;
                 }
             }
         }
@@ -224,6 +233,21 @@ impl Merger {
         }
     }
 
+    /// A fully transparent layer (`on_error: transparent`): compositing it changes nothing,
+    /// but it still counts as a layer for the single-layer shortcut.
+    fn add_transparent(&mut self) {
+        if self.canvas.is_none() {
+            match self.first.take() {
+                Some((f, fm)) => {
+                    let mut c = Rgba::blank(self.size.0, self.size.1);
+                    Self::apply(&mut c, &f, fm);
+                    self.canvas = Some(c);
+                }
+                None => self.first = Some((Rgba::blank(self.size.0, self.size.1), MergeMode::Composite)),
+            }
+        }
+    }
+
     fn add(&mut self, img: Rgba, mode: MergeMode) {
         if let Some(c) = &mut self.canvas {
             Self::apply(c, &img, mode);
@@ -252,10 +276,15 @@ impl Merger {
 }
 
 fn encode(img: &Rgba, opts: &ImageOpts) -> Result<Vec<u8>> {
-    if opts.colors.is_some() {
-        // TODO(parity): Pillow quantizers (mediancut/fastoctree) for paletted caches.
+    if let Some(colors) = opts.colors {
+        if opts.quantizer.as_deref() == Some("mediancut") {
+            // Caches here are transparent (checked in TileManager::new): MapProxy's alpha path.
+            let (pal, idx) = crate::image::quantize_mediancut_alpha(img, colors);
+            return crate::image::encode_png_paletted(img.w, img.h, &pal, &idx, true, png::Compression::Balanced);
+        }
+        // TODO(parity): Pillow's fastoctree (the default quantizer).
         static WARNED: std::sync::Once = std::sync::Once::new();
-        WARNED.call_once(|| warn!("paletted PNG (image.colors) not implemented yet; writing RGBA"));
+        WARNED.call_once(|| warn!("image.colors with the fastoctree quantizer is not implemented; writing RGBA"));
     }
     encode_png_rgba(img, png::Compression::Balanced)
 }

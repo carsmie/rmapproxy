@@ -16,7 +16,6 @@ use crate::srs::Srs;
 pub struct Globals {
     pub base_dir: PathBuf,
     pub tile_lock_dir: PathBuf,
-    pub tile_lock_timeout: f64,
     pub link_single_color: bool,
     pub client_timeout: f64,
     pub expires_hours: Option<f64>,
@@ -74,7 +73,6 @@ pub struct WmtsConf {
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub dir: PathBuf,
     pub globals: Globals,
     pub grids: BTreeMap<String, TileGrid>,
     pub caches: BTreeMap<String, CacheConf>,
@@ -296,7 +294,6 @@ impl Config {
                 .map(abspath)
                 .unwrap_or_else(|| base_dir.join("tile_locks")),
             base_dir,
-            tile_lock_timeout: get(&v, &["globals", "cache", "tile_lock_timeout"]).and_then(f64_of).unwrap_or(60.0),
             link_single_color: match get(&v, &["globals", "cache", "link_single_color_images"]) {
                 Some(Value::Bool(b)) => *b,
                 Some(Value::String(s)) => s == "hardlink" || s == "symlink" || s == "true",
@@ -422,7 +419,7 @@ impl Config {
             online_resource: md.and_then(|m| m.get("online_resource")).and_then(str_of).unwrap_or_default(),
         };
 
-        let cfg = Config { dir, globals, grids, caches, sources, layers, wmts };
+        let cfg = Config { globals, grids, caches, sources, layers, wmts };
         cfg.validate()?;
         Ok(cfg)
     }

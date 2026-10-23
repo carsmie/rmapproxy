@@ -11,11 +11,34 @@ use crate::image::{MergeMode, Rgba, decode_png};
 use crate::pyfloat::int;
 use crate::srs::{BBox, Srs};
 
-/// What a source contributes to a merge.
+/// What a source contributes to a merge. Responses stay encoded until merged, so a
+/// metatile holds at most one decoded source image at a time.
 pub enum SourceImage {
     /// `BlankImageError`: outside resolution range or coverage — not merged at all.
     Skip,
-    Image { img: Rgba, mode: MergeMode, cacheable: bool },
+    /// `on_error: transparent`: a fully transparent layer, not cacheable.
+    Transparent,
+    /// A PNG of `size`; with `place`, a coverage sub-image to paste at that offset into a
+    /// transparent canvas of the metatile size (`sub_image_result`).
+    Png { data: Vec<u8>, size: (u32, u32), place: Option<(i64, i64)> },
+}
+
+impl SourceImage {
+    /// Decode for merging: the image (metatile-sized) and how Pillow would merge it.
+    pub fn decode(data: &[u8], size: (u32, u32), place: Option<(i64, i64)>, canvas: (u32, u32)) -> Result<(Rgba, MergeMode)> {
+        let (img, mode) = decode_png(data)?;
+        if (img.w, img.h) != size {
+            bail!("got {}x{}, asked {}x{}", img.w, img.h, size.0, size.1);
+        }
+        Ok(match place {
+            None => (img, mode),
+            Some((x, y)) => {
+                let mut c = Rgba::blank(canvas.0, canvas.1);
+                c.paste(&img, x, y);
+                (c, MergeMode::Composite)
+            }
+        })
+    }
 }
 
 pub struct WmsSource {
@@ -65,7 +88,7 @@ impl WmsSource {
             Ok(r) => Ok(r),
             Err(e) if self.conf.on_error_transparent => {
                 warn!("source {}: {e:#}; transparent, not cached", self.conf.name);
-                Ok(SourceImage::Image { img: Rgba::blank(size.0, size.1), mode: MergeMode::Composite, cacheable: false })
+                Ok(SourceImage::Transparent)
             }
             Err(e) => Err(e),
         }
@@ -82,16 +105,13 @@ impl WmsSource {
                 if sub_size.0 == 0 || sub_size.1 == 0 {
                     return Ok(SourceImage::Skip);
                 }
-                let (img, _) = self.request(sub_bbox, sub_size, srs).await?;
-                // sub_image_result: transparent canvas with the image pasted (not composited);
-                // the result is RGBA, so it is composited when merged.
-                let mut canvas = Rgba::blank(size.0, size.1);
-                canvas.paste(&img, off.0, off.1);
-                return Ok(SourceImage::Image { img: canvas, mode: MergeMode::Composite, cacheable: true });
+                // sub_image_result: pasted into a transparent canvas, composited when merged.
+                let data = self.request(sub_bbox, sub_size, srs).await?;
+                return Ok(SourceImage::Png { data, size: sub_size, place: Some(off) });
             }
         }
-        let (img, mode) = self.request(bbox, size, srs).await?;
-        Ok(SourceImage::Image { img, mode, cacheable: true })
+        let data = self.request(bbox, size, srs).await?;
+        Ok(SourceImage::Png { data, size, place: None })
     }
 
     pub fn getmap_url(&self, bbox: BBox, size: (u32, u32), srs: &Srs) -> String {
@@ -121,7 +141,7 @@ impl WmsSource {
         format!("{}{}{}", self.conf.url, sep, qs.join("&"))
     }
 
-    async fn request(&self, bbox: BBox, size: (u32, u32), srs: &Srs) -> Result<(Rgba, MergeMode)> {
+    async fn request(&self, bbox: BBox, size: (u32, u32), srs: &Srs) -> Result<Vec<u8>> {
         let url = self.getmap_url(bbox, size, srs);
         debug!("source {}: {url}", self.conf.name);
         let resp = self
@@ -145,12 +165,7 @@ impl WmsSource {
         if !ctype.starts_with("image/") {
             bail!("no image from {url} ({ctype}): {}", String::from_utf8_lossy(&body[..body.len().min(200)]));
         }
-        let body = body.to_vec();
-        let (img, mode) = tokio::task::spawn_blocking(move || decode_png(&body)).await??;
-        if (img.w, img.h) != size {
-            bail!("{}: got {}x{}, asked {}x{}", self.conf.name, img.w, img.h, size.0, size.1);
-        }
-        Ok((img, mode))
+        Ok(body.to_vec())
     }
 }
 

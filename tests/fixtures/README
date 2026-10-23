@@ -1,2 +1,7 @@
 composite_*.png: generated with Pillow 10.2.0: 256x256, x = source alpha, y = destination alpha,
 random RGB (seed 1); composite_out = Image.alpha_composite(dst, src).
+quant_*_src.png / quant_*_pillow.txt: generated with Pillow 12.3.0 (tnt-mapproxy image) as
+Image.open(src).convert('RGB').convert('P', palette=Image.ADAPTIVE, colors=255) — MapProxy's
+mediancut call. Text = palette (r g b per line), '--', then the index rows.
+quant_gradient: noisy 300x300 gradient (>65536 colours, exercises hash rescaling);
+quant_tile: 256x256 crop of a real 2x topo tile (mountain relief, z09).

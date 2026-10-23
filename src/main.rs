@@ -5,7 +5,9 @@ mod config;
 mod coverage;
 mod grid;
 mod image;
+mod pickle;
 mod pyfloat;
+mod quantize;
 mod seed;
 mod server;
 mod source;
@@ -20,8 +22,9 @@ use anyhow::{Context, Result, anyhow, bail};
 const USAGE: &str = "\
 rmapproxy check -f mapproxy.yaml                       load the configuration and print a summary
 rmapproxy serve -f mapproxy.yaml [--bind ADDR]           WMTS on ADDR (default 0.0.0.0:8080)
-rmapproxy seed  -f mapproxy.yaml -s seed.yaml --seed a,b [-c N]   mapproxy-seed --seed subset
-                                                       (--continue, --progress-file, --log-config accepted, ignored)
+rmapproxy seed  -f mapproxy.yaml -s seed.yaml (--seed a,b | --cleanup a,b) [-c N]
+                [--progress-file F [--continue]] [--log-config X (ignored)]
+                                                       mapproxy-seed subset; also runs as `mapproxy-seed`
 rmapproxy tile  -f mapproxy.yaml --cache C --grid G Z/X/Y [-o out.png] [--no-store]
                                                        render (or load) one tile
 ";
@@ -30,7 +33,13 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "rmapproxy=info".into()))
         .init();
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // Installed as `mapproxy-seed` (what tnt-mapproxy's admin app and seed jobs run and
+    // look for in /proc/<pid>/cmdline): act as `rmapproxy seed`.
+    let argv0 = std::env::args().next().unwrap_or_default();
+    if std::path::Path::new(&argv0).file_name().is_some_and(|n| n == "mapproxy-seed") {
+        args.insert(0, "seed".into());
+    }
     let flag = |name: &str| args.windows(2).find(|w| w[0] == name).map(|w| w[1].clone());
     let has = |name: &str| args.iter().any(|a| a == name);
     let cfg_path = PathBuf::from(flag("-f").unwrap_or_else(|| "mapproxy.yaml".into()));
@@ -66,10 +75,16 @@ fn main() -> Result<()> {
             let cfg = Arc::new(config::Config::load(&cfg_path)?);
             let mgr = Arc::new(tile::TileManager::new(cfg)?);
             let seed_conf = PathBuf::from(flag("-s").context("-s seed.yaml")?);
-            let names: Vec<String> = flag("--seed").context("--seed")?.split(',').map(String::from).collect();
+            let (mode, names) = match (flag("--seed"), flag("--cleanup")) {
+                (Some(n), None) => (seed::Mode::Seed, n),
+                (None, Some(n)) => (seed::Mode::Cleanup, n),
+                _ => bail!("give exactly one of --seed or --cleanup"),
+            };
+            let names: Vec<String> = names.split(',').map(String::from).collect();
             let conc: usize = flag("-c").map(|c| c.parse()).transpose()?.unwrap_or(2);
-            let tasks = seed::load_tasks(&mgr, &seed_conf, &names)?;
-            rt.block_on(seed::run(mgr, tasks, conc))
+            let progress = flag("--progress-file").map(|p| seed::Progress::new(PathBuf::from(p), has("--continue")));
+            let tasks = seed::load_tasks(&mgr, &seed_conf, &names, mode)?;
+            rt.block_on(seed::run(mgr, tasks, mode, conc, progress))
         }
         Some("tile") => {
             let cfg = Arc::new(config::Config::load(&cfg_path)?);

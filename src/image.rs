@@ -175,6 +175,71 @@ pub fn encode_png_rgba(img: &Rgba, compression: png::Compression) -> Result<Vec<
     Ok(out)
 }
 
+/// Paletted PNG as Pillow's PngImagePlugin writes a P image with `transparency=255`:
+/// bit depth from the palette size, PLTE = palette, tRNS = (ff * 255 + 00)[:colors],
+/// indices packed to the bit depth (so index 255 keeps only its low bits).
+pub fn encode_png_paletted(w: u32, h: u32, palette: &[[u8; 3]], idx: &[u8], transparency: bool, compression: png::Compression) -> Result<Vec<u8>> {
+    let colors = palette.len().clamp(1, 256);
+    let bits: u8 = match colors {
+        0..=2 => 1,
+        3..=4 => 2,
+        5..=16 => 4,
+        _ => 8,
+    };
+    let mut plte: Vec<u8> = palette.iter().flatten().copied().collect();
+    plte.resize(colors * 3, 0);
+    let mut out = Vec::new();
+    {
+        let mut enc = png::Encoder::new(&mut out, w, h);
+        enc.set_color(png::ColorType::Indexed);
+        enc.set_depth(match bits {
+            1 => png::BitDepth::One,
+            2 => png::BitDepth::Two,
+            4 => png::BitDepth::Four,
+            _ => png::BitDepth::Eight,
+        });
+        enc.set_palette(plte);
+        if transparency {
+            let mut trns = vec![0xffu8; 255];
+            trns.push(0);
+            trns.truncate(colors);
+            enc.set_trns(trns);
+        }
+        enc.set_compression(compression);
+        let mut wr = enc.write_header()?;
+        if bits == 8 {
+            wr.write_image_data(idx)?;
+        } else {
+            let mask = (1u8 << bits) - 1;
+            let per = 8 / bits as usize;
+            let row_bytes = (w as usize).div_ceil(per);
+            let mut packed = vec![0u8; row_bytes * h as usize];
+            for y in 0..h as usize {
+                for x in 0..w as usize {
+                    let v = idx[y * w as usize + x] & mask;
+                    let shift = 8 - bits as usize * (x % per + 1);
+                    packed[y * row_bytes + x / per] |= v << shift;
+                }
+            }
+            wr.write_image_data(&packed)?;
+        }
+    }
+    Ok(out)
+}
+
+/// MapProxy `quantize(img, colors, alpha=True, quantizer='mediancut')`: median cut of the
+/// RGB channels to colors-1 entries, then index 255 where alpha <= 128.
+pub fn quantize_mediancut_alpha(img: &Rgba, colors: u32) -> (Vec<[u8; 3]>, Vec<u8>) {
+    let rgb: Vec<[u8; 3]> = img.px.chunks_exact(4).map(|p| [p[0], p[1], p[2]]).collect();
+    let (pal, mut idx) = crate::quantize::mediancut(&rgb, colors - 1);
+    for (i, p) in img.px.chunks_exact(4).enumerate() {
+        if p[3] <= 128 {
+            idx[i] = 255;
+        }
+    }
+    (pal, idx)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
