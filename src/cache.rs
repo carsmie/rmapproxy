@@ -69,6 +69,9 @@ impl FileCache {
                 match fs::hard_link(&real, &loc) {
                     Ok(()) => Ok(()),
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+                    // EMLINK: the colour file is at the fs link limit (~65000 on ext4). MapProxy
+                    // fails the tile here; a plain copy gives the same bytes.
+                    Err(e) if e.raw_os_error() == Some(libc::EMLINK) => write_atomic(&loc, data),
                     Err(e) => Err(e).with_context(|| format!("linking {}", loc.display())),
                 }
             }
