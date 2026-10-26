@@ -48,6 +48,7 @@ pub async fn serve(mgr: Arc<TileManager>, bind: &str) -> anyhow::Result<()> {
         .route("/healthz", get(|| async { "ok\n" }))
         .fallback(|| async { ows_error(StatusCode::NOT_FOUND, "NotFound", "unknown path") })
         .layer(axum::middleware::from_fn(cors))
+        .layer(axum::middleware::from_fn(access_log))
         .with_state(app);
     let listener = tokio::net::TcpListener::bind(bind).await?;
     info!("listening on {bind}");
@@ -68,6 +69,30 @@ async fn legend(State(app): State<App>, Path(file): Path<String>) -> Response {
             .into_response(),
         _ => (StatusCode::NOT_FOUND, [(header::CONTENT_TYPE, "text/plain")], "Not found").into_response(),
     }
+}
+
+/// One line per request (target `rmapproxy::access`); /healthz probes are skipped.
+async fn access_log(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let t0 = std::time::Instant::now();
+    let uri = req.uri().clone();
+    if uri.path() == "/healthz" {
+        return next.run(req).await;
+    }
+    let method = req.method().clone();
+    let (remote, ua) = {
+        let h = |n: &str| req.headers().get(n).and_then(|v| v.to_str().ok()).unwrap_or("-").to_string();
+        (h("x-forwarded-for"), h("user-agent"))
+    };
+    let resp = next.run(req).await;
+    // Content-Length is only set later by hyper; the body knows its size.
+    let bytes = axum::body::HttpBody::size_hint(resp.body()).exact().map_or("-".into(), |n| n.to_string());
+    info!(
+        target: "rmapproxy::access",
+        "{method} {uri} {} {bytes} {}ms remote={remote} ua={ua:?}",
+        resp.status().as_u16(),
+        t0.elapsed().as_millis()
+    );
+    resp
 }
 
 async fn cors(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
