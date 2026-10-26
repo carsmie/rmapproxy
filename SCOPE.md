@@ -19,15 +19,15 @@ below point into its `mapproxy/` package.
 | Sources | `type: wms` (1.1.1 GetMap), `req.{url,layers,transparent,dpi,format}`, `supported_srs`, `min_res`/`max_res`, `coverage` (`datasource` GeoJSON or `bbox`, with `srs`), `on_error.other: {response: transparent, cache: false}`, `http.client_timeout` | `source/wms.py`, `client/wms.py`, `util/coverage.py` |
 | Merge | transparent RGBA canvas + Pillow `alpha_composite` per source, bottom first | `image/merge.py` |
 | Services | WMTS GetTile KVP (`/service`) and REST (`/wmts/1.0.0/{layer}/{style}/{set}/{z}/{row}/{col}.png`), GetCapabilities | `service/wmts.py` |
+| WMS | 1.1.1 / 1.3.0 GetMap from caches (grid per SRS, closest level, merged tiles resampled bilinear, layer extents from source coverages, bgcolor/transparent), GetCapabilities | `service/wms.py`, `layer/cache_map_layer.py`, `image/tile.py` |
+| Reprojection | sources without the grid SRS: `best_srs`, transformed bbox/size, Pillow MESH bilinear (premultiplied RGBA) | `source/wms.py` `_get_transformed`, `image/transform.py` |
+| Legends | tnt-mapproxy's `/legend/topo-<scale>.png` files (written by the admin app) | tnt-mapproxy `app/main.py` |
 | Seeding | `mapproxy-seed -s seed.yaml -f mapproxy.yaml --seed a,b -c N --continue --progress-file F` subset: `levels`, `coverages`, `refresh_before`, `grids`, `caches` | `seed/` |
 
 ## Out of scope for v1 (decide later)
 
-* WMS service (GetMap from caches, reprojection, GetFeatureInfo, GetLegendGraphic) — prod
-  WMS traffic is near zero; legends are files served by the admin app.
-* Reprojecting sources: the `utm32n` / `utm35n` grids of `topo_cache` (sources don't support
-  those SRSs). `webmercator` works without reprojection (sources list EPSG:3857).
-* Demo service, TMS, KML, other cache backends, dimensions, `clip: true` coverages.
+* WMS GetFeatureInfo, GetLegendGraphic, `tiled=true` (WMS-C), `srs_extents` (`bbox_srs`).
+* Demo service (atgcp1-dev traffic to `/demo` is crawlers), TMS, KML, other cache backends, dimensions, `clip: true` coverages.
 * The admin app (`app/main.py`) stays Python and calls `rmapproxy seed` instead of
   `mapproxy-seed`; its log parser and progress file are the compatibility contract.
 

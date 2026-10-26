@@ -13,6 +13,8 @@ mod server;
 mod source;
 mod srs;
 mod tile;
+mod transform;
+mod wms;
 
 use std::path::PathBuf;
 use std::sync::Arc;

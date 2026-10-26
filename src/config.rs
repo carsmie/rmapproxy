@@ -64,6 +64,18 @@ pub struct LayerConf {
     pub sources: Vec<String>,
 }
 
+/// `services.wms` (`config/configuration/service.py` wms_service).
+#[derive(Debug, Clone, Default)]
+pub struct WmsConf {
+    /// `srs` (MapProxy's `wms.srs` default when unset).
+    pub srs: Vec<String>,
+    /// `image_formats` mime types (`wms.image_formats` default when unset).
+    pub image_formats: Vec<String>,
+    /// `md` as scalar strings; `contact` flattened under `contact.<key>`.
+    pub md: BTreeMap<String, String>,
+    pub max_output_pixels: u64,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct WmtsConf {
     pub title: String,
@@ -74,6 +86,8 @@ pub struct WmtsConf {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub globals: Globals,
+    /// `services.wms`, if configured.
+    pub wms: Option<WmsConf>,
     pub grids: BTreeMap<String, TileGrid>,
     pub caches: BTreeMap<String, CacheConf>,
     pub sources: BTreeMap<String, SourceConf>,
@@ -419,7 +433,41 @@ impl Config {
             online_resource: md.and_then(|m| m.get("online_resource")).and_then(str_of).unwrap_or_default(),
         };
 
-        let cfg = Config { globals, grids, caches, sources, layers, wmts };
+        let wms = get(&v, &["services", "wms"]).map(|w| {
+            let strs = |k: &str, d: &[&str]| -> Vec<String> {
+                match w.get(k).and_then(|x| x.as_sequence()) {
+                    Some(s) => s.iter().filter_map(str_of).collect(),
+                    None => d.iter().map(|x| x.to_string()).collect(),
+                }
+            };
+            let mut md = BTreeMap::new();
+            if let Some(m) = w.get("md").and_then(|m| m.as_mapping()) {
+                for (k, val) in m {
+                    let Some(k) = k.as_str() else { continue };
+                    if let Some(c) = val.as_mapping() {
+                        for (ck, cv) in c {
+                            if let (Some(ck), Some(cv)) = (ck.as_str(), str_of(cv)) {
+                                md.insert(format!("{k}.{ck}"), cv);
+                            }
+                        }
+                    } else if let Some(val) = str_of(val) {
+                        md.insert(k.to_string(), val);
+                    }
+                }
+            }
+            let max_output_pixels = match w.get("max_output_pixels") {
+                Some(Value::Sequence(s)) if s.len() == 2 => s[0].as_u64().unwrap_or(4000) * s[1].as_u64().unwrap_or(4000),
+                Some(x) => x.as_u64().unwrap_or(4000 * 4000),
+                None => 4000 * 4000,
+            };
+            WmsConf {
+                srs: strs("srs", &["EPSG:4326", "EPSG:4258", "CRS:84", "EPSG:900913", "EPSG:3857"]),
+                image_formats: strs("image_formats", &["image/png", "image/jpeg", "image/gif", "image/GeoTIFF", "image/tiff"]),
+                md,
+                max_output_pixels,
+            }
+        });
+        let cfg = Config { globals, wms, grids, caches, sources, layers, wmts };
         cfg.validate()?;
         Ok(cfg)
     }

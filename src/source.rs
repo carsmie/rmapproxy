@@ -7,9 +7,10 @@ use anyhow::{Result, anyhow, bail};
 use tracing::{debug, warn};
 
 use crate::config::SourceConf;
-use crate::image::{MergeMode, Rgba, decode_png};
+use crate::image::{MergeMode, Rgba, decode_png, decode_png_typed};
 use crate::pyfloat::int;
 use crate::srs::{BBox, Srs};
+use crate::transform::{mesh_warp, transform_meshes};
 
 /// What a source contributes to a merge. Responses stay encoded until merged, so a
 /// metatile holds at most one decoded source image at a time.
@@ -21,6 +22,8 @@ pub enum SourceImage {
     /// A PNG of `size`; with `place`, a coverage sub-image to paste at that offset into a
     /// transparent canvas of the metatile size (`sub_image_result`).
     Png { data: Vec<u8>, size: (u32, u32), place: Option<(i64, i64)> },
+    /// A reprojected image, metatile-sized, ready to merge.
+    Decoded(Rgba, MergeMode),
 }
 
 impl SourceImage {
@@ -47,6 +50,11 @@ pub struct WmsSource {
 }
 
 impl WmsSource {
+    /// The source's `image_opts.transparent` (from `req.transparent`).
+    fn transparent(&self) -> bool {
+        self.conf.params.iter().any(|(k, v)| k == "transparent" && v.eq_ignore_ascii_case("true"))
+    }
+
     pub fn new(conf: SourceConf, client: reqwest::Client) -> Self {
         WmsSource { conf, client }
     }
@@ -84,7 +92,9 @@ impl WmsSource {
                 return Ok(SourceImage::Skip);
             }
         }
-        match self.fetch(bbox, size, srs).await {
+        let needs_transform = !self.conf.supported_srs.is_empty() && !self.conf.supported_srs.contains(srs);
+        let r = if needs_transform { self.fetch_transformed(bbox, size, srs).await } else { self.fetch(bbox, size, srs).await };
+        match r {
             Ok(r) => Ok(r),
             Err(e) if self.conf.on_error_transparent => {
                 warn!("source {}: {e:#}; transparent, not cached", self.conf.name);
@@ -95,9 +105,6 @@ impl WmsSource {
     }
 
     async fn fetch(&self, bbox: BBox, size: (u32, u32), srs: &Srs) -> Result<SourceImage> {
-        if !self.conf.supported_srs.is_empty() && !self.conf.supported_srs.contains(srs) {
-            bail!("SRS {} not supported by source (reprojection is out of scope)", srs.code);
-        }
         if let Some(cov) = &self.conf.coverage {
             if !cov.extent_contains(bbox, srs)? {
                 // `_get_sub_query`: request only the part inside the coverage extent.
@@ -112,6 +119,61 @@ impl WmsSource {
         }
         let data = self.request(bbox, size, srs).await?;
         Ok(SourceImage::Png { data, size, place: None })
+    }
+
+    /// `_get_transformed`: request the best supported SRS over the transformed bbox, then
+    /// mesh-warp into the query SRS.
+    async fn fetch_transformed(&self, bbox: BBox, size: (u32, u32), dst: &Srs) -> Result<SourceImage> {
+        let src_srs = best_srs(dst, &self.conf.supported_srs);
+        let src_bbox = dst.transform_bbox(&src_srs, bbox)?;
+        let (w, h) = (src_bbox[2] - src_bbox[0], src_bbox[3] - src_bbox[1]);
+        let ratio = w / h;
+        let (xres, yres) = (w / size.0 as f64, h / size.1 as f64);
+        let src_size = if xres < yres {
+            (size.0, (size.0 as f64 / ratio + 0.5) as u32)
+        } else {
+            ((size.1 as f64 * ratio + 0.5) as u32, size.1)
+        };
+        // Polygon `contains` (not the extent test of the untransformed path) picks the
+        // sub-query, whose result is always RGBA (pasted onto a transparent canvas).
+        let (img, alpha, mode) = match &self.conf.coverage {
+            Some(cov) if !cov.contains(src_bbox, &src_srs)? => {
+                let (sub_size, off, sub_bbox) = bbox_position_in_image(src_bbox, src_size, cov.extent_bbox_for(&src_srs)?);
+                if sub_size.0 == 0 || sub_size.1 == 0 {
+                    return Ok(SourceImage::Skip);
+                }
+                let data = self.request(sub_bbox, sub_size, &src_srs).await?;
+                let (img, _) = tokio::task::block_in_place(|| SourceImage::decode(&data, sub_size, Some(off), src_size))?;
+                (img, true, MergeMode::Composite)
+            }
+            _ => {
+                let data = self.request(src_bbox, src_size, &src_srs).await?;
+                let (mut img, mode, ctype) = tokio::task::block_in_place(|| decode_png_typed(&data))?;
+                if (img.w, img.h) != src_size {
+                    bail!("got {}x{}, asked {}x{}", img.w, img.h, src_size.0, src_size.1);
+                }
+                match ctype {
+                    png::ColorType::Rgba => (img, true, mode),
+                    // LA: warped premultiplied (La), pasted when merged.
+                    png::ColorType::GrayscaleAlpha => (img, true, mode),
+                    // ImageResult.as_image: P -> RGBA for transparent sources; otherwise
+                    // img_for_resampling converts P to its palette mode, RGB: tRNS is lost.
+                    png::ColorType::Indexed if self.transparent() => (img, true, mode),
+                    png::ColorType::Indexed => {
+                        img.px.chunks_exact_mut(4).for_each(|p| p[3] = 255);
+                        (img, false, MergeMode::Paste)
+                    }
+                    // RGB/L; a tRNS colour key would be re-applied to warped pixels by
+                    // MapProxy — not replicated (rGIS/QGIS serve RGBA).
+                    _ => (img, false, MergeMode::Paste),
+                }
+            }
+        };
+        let out = tokio::task::block_in_place(|| -> Result<Rgba> {
+            let meshes = transform_meshes(src_size, src_bbox, &src_srs, size, bbox, dst)?;
+            Ok(mesh_warp(&img, alpha, size, &meshes))
+        })?;
+        Ok(SourceImage::Decoded(out, mode))
     }
 
     pub fn getmap_url(&self, bbox: BBox, size: (u32, u32), srs: &Srs) -> String {
@@ -167,6 +229,15 @@ impl WmsSource {
         }
         Ok(body.to_vec())
     }
+}
+
+/// `SupportedSRS.best_srs` without `preferred_src_proj`: the target itself, else the first
+/// with the same latlong-ness, else the first.
+pub fn best_srs(target: &Srs, supported: &[Srs]) -> Srs {
+    if supported.contains(target) {
+        return target.clone();
+    }
+    supported.iter().find(|s| s.geographic == target.geographic).unwrap_or(&supported[0]).clone()
 }
 
 /// `image.bbox_position_in_image(bbox, size, src_bbox)`: sub-image size, top-left offset

@@ -77,12 +77,6 @@ impl TileManager {
             }
             for g in &c.grids {
                 let grid = cfg.grids[g].clone();
-                // MapProxy reprojects sources that don't support the grid SRS; rMapproxy
-                // doesn't (yet), so such cache/grid pairs are not served.
-                if let Some(s) = srcs.iter().find(|s| !s.conf.supported_srs.is_empty() && !s.conf.supported_srs.contains(&grid.srs)) {
-                    warn!("cache {} grid {g}: source {} needs reprojection (not supported); skipped", c.name, s.conf.name);
-                    continue;
-                }
                 let cg = CacheGrid {
                     cache: c.name.clone(),
                     grid: g.clone(),
@@ -153,6 +147,7 @@ impl TileManager {
                     cacheable = false;
                     merger.add_transparent();
                 }
+                SourceImage::Decoded(img, mode) => merger.add(img, mode),
                 SourceImage::Png { data, size: sub, place } => {
                     // Decode + composite on this worker without stalling the runtime.
                     tokio::task::block_in_place(|| -> Result<()> {

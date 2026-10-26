@@ -20,7 +20,7 @@ It reads tnt-mapproxy's *rendered* config (`mapproxy.yaml` + `rendered/` as writ
 `entrypoint.sh`, including `rendered/hidpi.yaml`). `RUST_LOG=rmapproxy=debug` logs every
 source URL and per-metatile timings.
 
-## Status (2026-10-23)
+## Status (2026-10-26)
 
 Verified against MapProxy 7.0 (tnt-mapproxy image) on the same rendered config and the
 same local rGIS, Oslo box, `-c 4`, 4 dedicated cores:
@@ -48,6 +48,15 @@ order, coverage, levels, refresh_before / overwrite-all, `-c`), `--cleanup` (inc
 extent), `--progress-file` (pickle readable by tnt-mapproxy's admin) + `--continue`. Invoked
 as `mapproxy-seed` it behaves as the seed command. Static musl `Dockerfile` (rustls).
 
+2026-10-26, against MapProxy 7.0 with a deterministic fake WMS (RGBA, paletted+tRNS, opaque
+RGB, polygon coverage sub-queries):
+
+| | rMapproxy vs MapProxy 7.0 |
+|---|---|
+| Reprojected seeding, `utm32n` + `utm35n` z2–13 | **2 741 / 2 741 tiles pixel-identical**, same tile set |
+| WMS GetMap (PNG): tile passthrough, crop, bilinear EXTENT, MESH to 4326/3857, 1.3.0 axis order, bgcolor, multi-layer, extent clipping | **17 / 17 pixel-identical**, same RGB/RGBA mode |
+| WMS GetCapabilities 1.1.1 / 1.3.0 | same document except GetFeatureInfo (not offered) and last-digit float noise |
+
 Note: MapProxy's mediancut path marks transparent pixels as palette index 255, which lies
 outside the written palette/tRNS (or gets truncated to a lower bit depth), so those pixels
 decode as opaque black. rMapproxy reproduces that byte for byte (parity); fixing it would
@@ -57,8 +66,9 @@ change tiles relative to MapProxy.
 
 1. `fastoctree` quantizer (MapProxy's default, only `qgis_hoydekurve_cache` uses it): written
    as RGBA with a warning.
-2. Reprojection for `utm32n` / `utm35n` (those cache/grid pairs are skipped and not
-   advertised); WMS service; legends; the admin GUI (stays in tnt-mapproxy).
+2. WMS GetFeatureInfo / GetLegendGraphic / `tiled=true` (WMS-C); JPEG is encoded with
+   `jpeg-encoder` (not byte-identical to Pillow's libjpeg); the `/demo` UI; the admin GUI
+   (stays in tnt-mapproxy).
 3. Seeding: `refresh_before.time/mtime`, multiple coverages per task.
 
 Deployment: [kartverket/tnt-rmapproxy](https://github.com/kartverket/tnt-rmapproxy) builds a

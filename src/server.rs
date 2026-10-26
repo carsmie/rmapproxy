@@ -22,6 +22,8 @@ struct App {
     mgr: Arc<TileManager>,
     /// WMTS layer name -> its cache (layers with exactly one cache source).
     layers: Arc<HashMap<String, (LayerConf, String)>>,
+    /// WMS from the caches, when `services.wms` is configured.
+    wms: Option<Arc<crate::wms::Wms>>,
 }
 
 pub async fn serve(mgr: Arc<TileManager>, bind: &str) -> anyhow::Result<()> {
@@ -34,12 +36,15 @@ pub async fn serve(mgr: Arc<TileManager>, bind: &str) -> anyhow::Result<()> {
             _ => warn!("layer {}: only single-cache layers are served over WMTS", l.name),
         }
     }
-    let app = App { mgr, layers: Arc::new(layers) };
+    let wms = crate::wms::Wms::new(mgr.clone()).map(Arc::new);
+    let app = App { mgr, layers: Arc::new(layers), wms };
     let router = Router::new()
         .route("/service", get(kvp))
         .route("/wmts", get(kvp))
+        .route("/wms", get(wms_path))
         .route("/wmts/1.0.0/WMTSCapabilities.xml", get(rest_caps))
         .route("/wmts/1.0.0/{layer}/{style}/{set}/{z}/{row}/{file}", get(rest_tile))
+        .route("/legend/{file}", get(legend))
         .route("/healthz", get(|| async { "ok\n" }))
         .fallback(|| async { ows_error(StatusCode::NOT_FOUND, "NotFound", "unknown path") })
         .layer(axum::middleware::from_fn(cors))
@@ -48,6 +53,21 @@ pub async fn serve(mgr: Arc<TileManager>, bind: &str) -> anyhow::Result<()> {
     info!("listening on {bind}");
     axum::serve(listener, router).await?;
     Ok(())
+}
+
+/// tnt-mapproxy's `/legend/topo-<scale>.png`: files the admin app writes to
+/// MAPPROXY_LEGEND_DIR (default `<cache base_dir>/legend`).
+async fn legend(State(app): State<App>, Path(file): Path<String>) -> Response {
+    let ok = file.strip_prefix("topo-").and_then(|f| f.strip_suffix(".png")).is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+    let dir = std::env::var_os("MAPPROXY_LEGEND_DIR").map(std::path::PathBuf::from).unwrap_or_else(|| app.mgr.cfg.globals.base_dir.join("legend"));
+    match ok.then(|| std::fs::read(dir.join(&file))) {
+        Some(Ok(data)) => (
+            [(header::CONTENT_TYPE, "image/png"), (header::CACHE_CONTROL, "public, max-age=3600")],
+            data,
+        )
+            .into_response(),
+        _ => (StatusCode::NOT_FOUND, [(header::CONTENT_TYPE, "text/plain")], "Not found").into_response(),
+    }
 }
 
 async fn cors(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
@@ -76,6 +96,9 @@ fn ows_error(status: StatusCode, code: &str, text: &str) -> Response {
 async fn kvp(State(app): State<App>, Query(q): Query<HashMap<String, String>>, headers: HeaderMap) -> Response {
     let q: HashMap<String, String> = q.into_iter().map(|(k, v)| (k.to_ascii_lowercase(), v)).collect();
     let p = |k: &str| q.get(k).map(String::as_str).unwrap_or("");
+    if p("service").eq_ignore_ascii_case("wms") {
+        return wms_kvp(&app, &q, &headers, "/service").await;
+    }
     if !p("service").eq_ignore_ascii_case("wmts") {
         return ows_error(StatusCode::BAD_REQUEST, "MissingParameterValue", "service must be WMTS");
     }
@@ -89,6 +112,19 @@ async fn kvp(State(app): State<App>, Query(q): Query<HashMap<String, String>>, h
         }
         "getcapabilities" => caps(&app, &headers, false),
         r => ows_error(StatusCode::BAD_REQUEST, "OperationNotSupported", &format!("unknown request {r}")),
+    }
+}
+
+/// `/wms`: SERVICE defaults to WMS.
+async fn wms_path(State(app): State<App>, Query(q): Query<HashMap<String, String>>, headers: HeaderMap) -> Response {
+    let q: HashMap<String, String> = q.into_iter().map(|(k, v)| (k.to_ascii_lowercase(), v)).collect();
+    wms_kvp(&app, &q, &headers, "/wms").await
+}
+
+async fn wms_kvp(app: &App, q: &HashMap<String, String>, headers: &HeaderMap, path: &str) -> Response {
+    match &app.wms {
+        Some(w) => w.handle(q, &format!("{}{path}", request_base(headers))).await,
+        None => ows_error(StatusCode::BAD_REQUEST, "InvalidParameterValue", "WMS is not configured"),
     }
 }
 
@@ -157,6 +193,14 @@ async fn tile(app: &App, layer: &str, set: &str, z: &str, row: &str, col: &str) 
             ows_error(StatusCode::INTERNAL_SERVER_ERROR, "NoApplicableCode", &format!("{e:#}"))
         }
     }
+}
+
+/// The request's own base URL (X-Forwarded-Proto/-Host first, as MapProxy behind nginx).
+fn request_base(headers: &HeaderMap) -> String {
+    let h = |n: &str| headers.get(n).and_then(|v| v.to_str().ok()).map(String::from);
+    let proto = h("x-forwarded-proto").unwrap_or_else(|| "http".into());
+    let host = h("x-forwarded-host").or_else(|| h("host")).unwrap_or_else(|| "localhost".into());
+    format!("{proto}://{host}")
 }
 
 /// Public base URL: MAPPROXY_PUBLIC_URL / services online_resource, else from the request.

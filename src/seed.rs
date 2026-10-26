@@ -122,7 +122,12 @@ pub fn load_tasks(mgr: &TileManager, seed_conf: &Path, names: &[String], mode: M
             for g in grids {
                 let cg = mgr.cache_grid(cache, &g).ok_or_else(|| anyhow!("{name}: cache {cache} has no grid {g}"))?;
                 let levels = levels_of(s.get("levels"), cg.meta.grid.res.len());
-                tasks.push(SeedTask { name: name.clone(), cg, levels, coverage: coverages.first().cloned(), before });
+                // SeedTask: coverage.transform_to(grid.srs) once, then tested in grid coords.
+                let coverage = match coverages.first() {
+                    Some(c) => Some(Arc::new(c.transform_to(&cg.meta.grid.srs).with_context(|| format!("{name}: coverage"))?)),
+                    None => None,
+                };
+                tasks.push(SeedTask { name: name.clone(), cg, levels, coverage, before });
             }
         }
     }

@@ -86,6 +86,30 @@ impl Coverage {
         Ok(Coverage { srs, bbox, polygons })
     }
 
+    /// `Coverage.transform_to(srs)`: a bbox coverage by its 16-point envelope, polygons
+    /// vertex by vertex (`transform_geometry`, no densification).
+    pub fn transform_to(&self, srs: &Srs) -> Result<Coverage> {
+        if *srs == self.srs {
+            return Ok(Coverage { srs: self.srs.clone(), bbox: self.bbox, polygons: self.polygons.clone() });
+        }
+        if self.polygons.is_empty() {
+            return Ok(Coverage { srs: srs.clone(), bbox: self.srs.transform_bbox(srs, self.bbox)?, polygons: vec![] });
+        }
+        let mut polygons = Vec::with_capacity(self.polygons.len());
+        for p in &self.polygons {
+            let rings = p
+                .iter()
+                .map(|r| r.iter().map(|&(x, y)| self.srs.transform_point(srs, x, y)).collect::<Result<Ring>>())
+                .collect::<Result<Vec<Ring>>>()?;
+            polygons.push(rings);
+        }
+        let mut bbox = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+        for &(x, y) in polygons.iter().filter_map(|p| p.first()).flatten() {
+            bbox = [bbox[0].min(x), bbox[1].min(y), bbox[2].max(x), bbox[3].max(y)];
+        }
+        Ok(Coverage { srs: srs.clone(), bbox, polygons })
+    }
+
     fn bbox_in_coverage_srs(&self, bbox: BBox, srs: &Srs) -> Result<BBox> {
         srs.transform_bbox(&self.srs, bbox)
     }

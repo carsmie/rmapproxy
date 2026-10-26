@@ -118,6 +118,11 @@ pub enum MergeMode {
 }
 
 pub fn decode_png(data: &[u8]) -> Result<(Rgba, MergeMode)> {
+    decode_png_typed(data).map(|(img, mode, _)| (img, mode))
+}
+
+/// `decode_png` plus the PNG's colour type (Pillow mode before expansion).
+pub fn decode_png_typed(data: &[u8]) -> Result<(Rgba, MergeMode, png::ColorType)> {
     let mut dec = png::Decoder::new(std::io::Cursor::new(data));
     dec.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
     let mut reader = dec.read_info().map_err(|e| anyhow!("png: {e}"))?;
@@ -126,6 +131,7 @@ pub fn decode_png(data: &[u8]) -> Result<(Rgba, MergeMode)> {
     // Pillow mode before expansion: RGBA and P (with or without tRNS) are composited,
     // RGB/L with a tRNS colour key are converted to RGBA first ('transparency' in info),
     // plain RGB/L/LA are pasted.
+    let ctype = info.color_type;
     let mode = match info.color_type {
         png::ColorType::Rgba | png::ColorType::Indexed => MergeMode::Composite,
         _ if info.trns.is_some() => MergeMode::Composite,
@@ -158,7 +164,7 @@ pub fn decode_png(data: &[u8]) -> Result<(Rgba, MergeMode)> {
     if px.len() != n * 4 {
         bail!("png: unexpected buffer size");
     }
-    Ok((Rgba { w, h, px }, mode))
+    Ok((Rgba { w, h, px }, mode, ctype))
 }
 
 /// RGBA PNG (MapProxy's default for transparent png caches without `colors`).
