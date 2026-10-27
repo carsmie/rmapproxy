@@ -243,10 +243,8 @@ impl Wms {
 
     /// `SRSConditional.get_map` -> `CacheMapLayer.get_map`. None = BlankImageError.
     async fn cache_layer_map(&self, m: &CacheLayer, q: &Query) -> Result<Option<Img>> {
-        if let Some(r) = m.res_range {
-            if !res_range_contains(r, q) {
-                return Ok(None);
-            }
+        if let Some(r) = m.res_range && !res_range_contains(r, q) {
+            return Ok(None);
         }
         let srs_list: Vec<Srs> = m.grids.iter().map(|g| g.0.meta.grid.srs.clone()).collect();
         let pick = best_srs(&q.srs, &srs_list);
@@ -411,10 +409,8 @@ impl Wms {
         let mut x = ll_xml(limit_llbbox(e.llbbox().unwrap_or([-180.0, -90.0, 180.0, 90.0])), v130, ind);
         let defaults = ["EPSG:3857", "EPSG:4326"];
         for code in defaults {
-            if self.conf.srs.iter().any(|s| s == code) {
-                if let Ok(b) = Srs::new(code).and_then(|s| e.bbox_for(&s)) {
-                    x.push_str(&bbox_xml(code, b, v130, ind));
-                }
+            if self.conf.srs.iter().any(|s| s == code) && let Ok(b) = Srs::new(code).and_then(|s| e.bbox_for(&s)) {
+                x.push_str(&bbox_xml(code, b, v130, ind));
             }
         }
         if !defaults.contains(&e.srs.code.as_str()) {
@@ -501,7 +497,7 @@ fn merge(mut imgs: Vec<Img>, size: (u32, u32), transparent: bool, bg: [u8; 3]) -
             c.alpha_composite(&img);
         } else {
             // RGB canvas: paste(img, (0, 0), img) — Paste.c BLEND with the alpha as mask.
-            for (o, p) in c.px.chunks_exact_mut(4).zip(img.px.chunks_exact(4)) {
+            for (o, p) in c.px.as_chunks_mut::<4>().0.iter_mut().zip(img.px.as_chunks::<4>().0) {
                 let a = p[3] as u32;
                 for k in 0..3 {
                     let t = o[k] as u32 * (255 - a) + p[k] as u32 * a + 128;
@@ -524,7 +520,7 @@ fn encode(img: Img, format: &str, transparent: bool) -> Result<(&'static str, Ve
         if transparent {
             return Ok(("image/png", encode_png_rgba(&img, png::Compression::Fast)?));
         }
-        let rgb: Vec<u8> = img.px.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
+        let rgb: Vec<u8> = img.px.as_chunks::<4>().0.iter().flat_map(|p| [p[0], p[1], p[2]]).collect();
         let mut out = vec![];
         let mut e = png::Encoder::new(&mut out, img.w, img.h);
         e.set_color(png::ColorType::Rgb);
@@ -533,7 +529,7 @@ fn encode(img: Img, format: &str, transparent: bool) -> Result<(&'static str, Ve
         e.write_header()?.write_image_data(&rgb)?;
         return Ok(("image/png", out));
     }
-    let rgb: Vec<u8> = img.px.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
+    let rgb: Vec<u8> = img.px.as_chunks::<4>().0.iter().flat_map(|p| [p[0], p[1], p[2]]).collect();
     let mut out = vec![];
     // base_config().image.jpeg_quality default 90.
     jpeg_encoder::Encoder::new(&mut out, 90).encode(&rgb, img.w as u16, img.h as u16, jpeg_encoder::ColorType::Rgb)?;
@@ -544,10 +540,8 @@ fn encode(img: Img, format: &str, transparent: bool) -> Result<(&'static str, Ve
 fn closest_level(res: &[f64], want: f64) -> usize {
     let mut threshold_result = None;
     for (level, &l_res) in res.iter().enumerate() {
-        if let Some(t) = threshold_result {
-            if l_res < want {
-                return t;
-            }
+        if let Some(t) = threshold_result && l_res < want {
+            return t;
         }
         if l_res <= want * STRETCH_FACTOR {
             threshold_result = Some(level);
@@ -571,10 +565,8 @@ fn res_range_contains((min, max): (Option<f64>, Option<f64>), q: &Query) -> bool
             return false;
         }
     }
-    if let Some(max) = max {
-        if max > xr || max > yr {
-            return false;
-        }
+    if let Some(max) = max && (max > xr || max > yr) {
+        return false;
     }
     true
 }

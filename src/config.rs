@@ -396,10 +396,8 @@ impl Config {
         if let Some(m) = v.get("caches").and_then(|s| s.as_mapping()) {
             for (k, c) in m {
                 let name = k.as_str().unwrap_or_default().to_string();
-                if let Some(t) = get(c, &["cache", "type"]).and_then(|t| t.as_str()) {
-                    if t != "file" {
-                        bail!("cache {name}: type {t} not supported");
-                    }
+                if let Some(t) = get(c, &["cache", "type"]).and_then(|t| t.as_str()) && t != "file" {
+                    bail!("cache {name}: type {t} not supported");
                 }
                 let img = c.get("image");
                 let colors = img.and_then(|i| i.get("colors")).and_then(|c| c.as_u64()).map(|c| c as u32).filter(|&c| c > 0);

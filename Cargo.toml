@@ -2,6 +2,7 @@
 name = "rmapproxy"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 description = "Rust replacement for the MapProxy features tnt-mapproxy uses (WMTS tiles from WMS sources, file cache, seeding)"
 license = "Apache-2.0"
 

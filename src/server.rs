@@ -191,6 +191,7 @@ async fn rest_caps(State(app): State<App>, headers: HeaderMap) -> Response {
     caps(&app, &headers, true)
 }
 
+#[allow(clippy::result_large_err)] // the error is the ready response
 fn resolve(app: &App, layer: &str, set: &str) -> Result<Arc<CacheGrid>, Response> {
     let (_, cache) = app
         .layers
@@ -230,10 +231,8 @@ async fn tile(app: &App, layer: &str, set: &str, z: &str, row: &str, col: &str) 
                     h.insert(header::CACHE_CONTROL, v);
                 }
             }
-            if let Some(m) = t.mtime {
-                if let Ok(v) = HeaderValue::from_str(&httpdate::fmt_http_date(m)) {
-                    h.insert(header::LAST_MODIFIED, v);
-                }
+            if let Some(m) = t.mtime && let Ok(v) = HeaderValue::from_str(&httpdate::fmt_http_date(m)) {
+                h.insert(header::LAST_MODIFIED, v);
             }
             r
         }

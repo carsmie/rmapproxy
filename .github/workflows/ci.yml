@@ -17,6 +17,5 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      # Clippy's deny-by-default lints fail the build; its warnings are reported only.
-      - run: cargo clippy --all-targets --locked
+      - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked

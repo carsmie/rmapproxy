@@ -627,7 +627,7 @@ mod tests {
         for name in ["quant_gradient", "quant_tile"] {
             let src = crate::image::decode_png(&std::fs::read(format!("{dir}/{name}_src.png")).unwrap()).unwrap().0;
             let want = std::fs::read_to_string(format!("{dir}/{name}_pillow.txt")).unwrap();
-            let px: Vec<Px> = src.px.chunks_exact(4).map(|c| [c[0], c[1], c[2]]).collect();
+            let px: Vec<Px> = src.px.as_chunks::<4>().0.iter().map(|c| [c[0], c[1], c[2]]).collect();
             let (pal, idx) = mediancut(&px, 255);
             let mut got = String::new();
             for p in &pal {

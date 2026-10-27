@@ -54,6 +54,9 @@ impl Drop for Flight<'_> {
     }
 }
 
+/// A tile of a rendered metatile: coordinate, encoded image, single colour (if any).
+type EncodedTile = (TileCoord, Vec<u8>, Option<[u8; 4]>);
+
 pub struct Tile {
     pub data: Vec<u8>,
     pub mtime: Option<SystemTime>,
@@ -214,7 +217,7 @@ impl TileManager {
         let tile_size = cg.meta.grid.tile_size;
         let tiles: Vec<(TileCoord, (u32, u32))> = meta.tiles.iter().filter_map(|(c, off)| c.map(|c| (c, *off))).collect();
         let image = cg.image.clone();
-        let encoded = tokio::task::spawn_blocking(move || -> Result<Vec<(TileCoord, Vec<u8>, Option<[u8; 4]>)>> {
+        let encoded = tokio::task::spawn_blocking(move || -> Result<Vec<EncodedTile>> {
             let merged = merger.finish();
             let parts: Vec<_> = tiles
                 .iter()

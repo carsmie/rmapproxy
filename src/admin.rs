@@ -344,7 +344,7 @@ impl Admin {
             job.progress = read_progress(&self.progress_path(&job.id)).unwrap_or_default();
             jobs.push(job);
         }
-        jobs.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        jobs.sort_by_key(|a| a.created_at);
         info!("admin: {} unfinished job(s) in {}", jobs.len(), self.dir.display());
         *self.jobs.lock() = jobs;
     }
@@ -758,10 +758,8 @@ impl Admin {
             j.tiles += w[2].parse::<u64>().unwrap_or(0);
             j.errors += w[5].parse::<u64>().unwrap_or(0);
             j.task_tiles = 0;
-        } else if line.starts_with('[') && line.ends_with(" tiles)") {
-            if let Some(n) = line.rsplit_once('(').and_then(|(_, r)| r.split_whitespace().next()?.parse().ok()) {
-                j.task_tiles = n;
-            }
+        } else if line.starts_with('[') && line.ends_with(" tiles)") && let Some(n) = line.rsplit_once('(').and_then(|(_, r)| r.split_whitespace().next()?.parse().ok()) {
+            j.task_tiles = n;
         }
         j.last_activity = SystemTime::now();
         if j.log.len() >= LOG_MAX {
@@ -910,10 +908,8 @@ impl Admin {
         if j.queue.is_some() {
             return self.distributed_json(j, with_log);
         }
-        if matches!(j.state, "running" | "stopping") {
-            if let Some(p) = read_progress(&self.progress_path(&j.id)) {
-                j.progress = p;
-            }
+        if matches!(j.state, "running" | "stopping") && let Some(p) = read_progress(&self.progress_path(&j.id)) {
+            j.progress = p;
         }
         let running = matches!(j.state, "running" | "stopping");
         let duration = match j.finished_at {
@@ -1137,10 +1133,8 @@ impl Admin {
 
     fn release(&self, b: &Json) {
         let (job, chunk) = (b["job"].as_str().unwrap_or_default(), b["chunk"].as_u64().unwrap_or(u64::MAX) as usize);
-        if let Some(q) = self.jobs.lock().iter_mut().find(|j| j.id == job).and_then(|j| j.queue.as_mut()) {
-            if chunk < q.len() {
-                q.release(chunk);
-            }
+        if let Some(q) = self.jobs.lock().iter_mut().find(|j| j.id == job).and_then(|j| j.queue.as_mut()) && chunk < q.len() {
+            q.release(chunk);
         }
         self.seen(b["worker"].as_str().unwrap_or("?"), None, None);
     }
@@ -1758,6 +1752,7 @@ async fn guard(req: axum::extract::Request, next: axum::middleware::Next) -> Res
     next.run(req).await
 }
 
+#[allow(clippy::result_large_err)] // the error is the ready response
 fn parse_body(body: &Bytes) -> Result<Json, Response> {
     serde_json::from_slice(body).map_err(|e| msg(StatusCode::BAD_REQUEST, format!("Ugyldig JSON: {e}")))
 }

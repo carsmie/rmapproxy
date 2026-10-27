@@ -362,14 +362,10 @@ impl SeedKey {
 impl Progress {
     pub fn new(path: PathBuf, resume: bool) -> Progress {
         let mut done = BTreeMap::new();
-        if resume {
-            if let Ok(s) = std::fs::read_to_string(Self::sidecar(&path)) {
-                if let Ok(serde_json::Value::Object(m)) = serde_json::from_str::<serde_json::Value>(&s) {
-                    for (k, v) in m {
-                        if let (Some(d), Some(t)) = (v[0].as_u64(), v[1].as_u64()) {
-                            done.insert(k, (d as usize, t as usize));
-                        }
-                    }
+        if resume && let Ok(s) = std::fs::read_to_string(Self::sidecar(&path)) && let Ok(serde_json::Value::Object(m)) = serde_json::from_str::<serde_json::Value>(&s) {
+            for (k, v) in m {
+                if let (Some(d), Some(t)) = (v[0].as_u64(), v[1].as_u64()) {
+                    done.insert(k, (d as usize, t as usize));
                 }
             }
         }

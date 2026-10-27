@@ -438,12 +438,8 @@ async fn render_chunk(
                 let mut b = body.clone();
                 b["done"] = done.load(Ordering::Relaxed).into();
                 b["tiles"] = tiles.load(Ordering::Relaxed).into();
-                if let Ok(r) = post_json(&client, &url, &b).await {
-                    if let Some(v) = r.bytes().await.ok().and_then(|b| serde_json::from_slice::<Json>(&b).ok()) {
-                        if v["keep"] == false {
-                            lost.store(true, Ordering::SeqCst);
-                        }
-                    }
+                if let Ok(r) = post_json(&client, &url, &b).await && let Some(v) = r.bytes().await.ok().and_then(|b| serde_json::from_slice::<Json>(&b).ok()) && v["keep"] == false {
+                    lost.store(true, Ordering::SeqCst);
                 }
             }
         })
