@@ -38,6 +38,33 @@ rmapproxy tile  -f mapproxy.yaml --cache C --grid G Z/X/Y [-o out.png] [--no-sto
                                                        render (or load) one tile
 ";
 
+/// Per command: flags that take a value, and switches.
+fn known_flags(cmd: &str) -> (&'static [&'static str], &'static [&'static str]) {
+    match cmd {
+        "check" => (&["-f"], &[]),
+        "serve" => (&["-f", "--bind", "--seed-conf", "--admin-assets"], &["--admin"]),
+        "seed" => (&["-f", "-s", "--seed", "--cleanup", "-c", "--progress-file", "--log-config"], &["--continue"]),
+        "seed-worker" => (&["-f", "--admin", "--name", "--bind"], &[]),
+        "tile" => (&["-f", "--cache", "--grid", "-o"], &["--no-store"]),
+        _ => (&[], &[]),
+    }
+}
+
+/// Flags are parsed loosely (`mapproxy-seed` callers may pass more than this subset), so a
+/// typo would otherwise go unnoticed.
+fn warn_unknown_flags(args: &[String]) {
+    let Some(cmd) = args.first() else { return };
+    let (values, switches) = known_flags(cmd);
+    let mut it = args.iter().skip(1);
+    while let Some(a) = it.next() {
+        if values.contains(&a.as_str()) {
+            it.next();
+        } else if a.starts_with('-') && !switches.contains(&a.as_str()) {
+            tracing::warn!("{cmd}: unknown option {a} ignored");
+        }
+    }
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "rmapproxy=info".into()))
@@ -49,6 +76,7 @@ fn main() -> Result<()> {
     if std::path::Path::new(&argv0).file_name().is_some_and(|n| n == "mapproxy-seed") {
         args.insert(0, "seed".into());
     }
+    warn_unknown_flags(&args);
     let flag = |name: &str| args.windows(2).find(|w| w[0] == name).map(|w| w[1].clone());
     let has = |name: &str| args.iter().any(|a| a == name);
     let cfg_path = PathBuf::from(flag("-f").unwrap_or_else(|| "mapproxy.yaml".into()));
