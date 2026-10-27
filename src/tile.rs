@@ -69,6 +69,15 @@ pub struct TileManager {
 
 impl TileManager {
     pub fn new(cfg: Arc<Config>) -> Result<TileManager> {
+        let max_renders = match std::env::var("RMAPPROXY_MAX_RENDERS") {
+            Ok(v) => v.parse::<usize>().with_context(|| format!("RMAPPROXY_MAX_RENDERS={v}"))?,
+            Err(_) => 32,
+        };
+        Self::with_max_renders(cfg, max_renders)
+    }
+
+    /// `new` with an explicit on-demand render limit (0 = unbounded).
+    pub fn with_max_renders(cfg: Arc<Config>, max_renders: usize) -> Result<TileManager> {
         let client = reqwest::Client::builder()
             .pool_max_idle_per_host(64)
             .user_agent(concat!("rmapproxy/", env!("CARGO_PKG_VERSION")))
@@ -125,10 +134,6 @@ impl TileManager {
                 caches.insert((c.name.clone(), g.clone()), Arc::new(cg));
             }
         }
-        let max_renders = match std::env::var("RMAPPROXY_MAX_RENDERS") {
-            Ok(v) => v.parse::<usize>().with_context(|| format!("RMAPPROXY_MAX_RENDERS={v}"))?,
-            Err(_) => 32,
-        };
         let renders = (max_renders > 0).then(|| tokio::sync::Semaphore::new(max_renders));
         Ok(TileManager { cfg, caches, renders })
     }

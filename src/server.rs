@@ -27,6 +27,17 @@ struct App {
 }
 
 pub async fn serve(mgr: Arc<TileManager>, bind: &str, admin: Option<crate::admin::AdminOpts>) -> anyhow::Result<()> {
+    let router = app(mgr, admin)?;
+    let listener = tokio::net::TcpListener::bind(bind).await?;
+    info!("listening on {bind}");
+    axum::serve(listener, router).with_graceful_shutdown(shutdown_signal()).await?;
+    info!("stopped");
+    Ok(())
+}
+
+/// All routes of `serve`; with `admin`, the admin API too (which starts its background tasks,
+/// so this needs a runtime).
+pub fn app(mgr: Arc<TileManager>, admin: Option<crate::admin::AdminOpts>) -> anyhow::Result<Router> {
     let mut layers = HashMap::new();
     for l in &mgr.cfg.layers {
         match l.sources.as_slice() {
@@ -56,12 +67,7 @@ pub async fn serve(mgr: Arc<TileManager>, bind: &str, admin: Option<crate::admin
         info!("admin API on /_admin");
         router = router.merge(crate::admin::router(a));
     }
-    let router = router.layer(axum::middleware::from_fn(access_log));
-    let listener = tokio::net::TcpListener::bind(bind).await?;
-    info!("listening on {bind}");
-    axum::serve(listener, router).with_graceful_shutdown(shutdown_signal()).await?;
-    info!("stopped");
-    Ok(())
+    Ok(router.layer(axum::middleware::from_fn(access_log)))
 }
 
 /// SIGTERM (pod shutdown) or SIGINT: in-flight requests finish, new connections are refused.

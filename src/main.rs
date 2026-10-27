@@ -4,6 +4,8 @@ mod admin;
 mod cache;
 mod config;
 mod coverage;
+#[cfg(test)]
+mod e2e_tests;
 mod grid;
 mod image;
 mod pickle;
