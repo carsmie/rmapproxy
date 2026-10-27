@@ -78,7 +78,12 @@ fn before_timestamp(v: Option<&Value>) -> Result<Option<SystemTime>> {
 /// Tasks named in `names` from the `seeds:` or `cleanups:` section (one per cache × grid).
 pub fn load_tasks(mgr: &TileManager, seed_conf: &Path, names: &[String], mode: Mode) -> Result<Vec<SeedTask>> {
     let v = load_yaml_with_bases(seed_conf)?;
-    let dir = seed_conf.parent().unwrap_or(Path::new("."));
+    load_tasks_from(mgr, &v, seed_conf.parent().unwrap_or(Path::new(".")), names, mode)
+}
+
+/// `load_tasks` from an already loaded seed configuration; relative datasources resolve
+/// against `dir` (the admin estimates its job configurations without writing them first).
+pub fn load_tasks_from(mgr: &TileManager, v: &Value, dir: &Path, names: &[String], mode: Mode) -> Result<Vec<SeedTask>> {
     let abspath = |p: &str| {
         let p = PathBuf::from(p);
         if p.is_absolute() { p } else { dir.join(p) }
@@ -418,9 +423,10 @@ pub async fn run(mgr: Arc<TileManager>, tasks: Vec<SeedTask>, mode: Mode, concur
         }
         println!("    Levels: {:?}", task.levels);
         match (seeding, task.before) {
-            (true, Some(t)) => println!("    Overwriting: tiles older than {}", httpdate::fmt_http_date(t)),
+            // fmt_http_date panics before 1970 (refresh_before of over ~56 years).
+            (true, Some(t)) => println!("    Overwriting: tiles older than {}", httpdate::fmt_http_date(t.max(SystemTime::UNIX_EPOCH))),
             (true, None) => println!("    Overwriting: all tiles"),
-            (false, Some(t)) => println!("    Remove: tiles older than {}", httpdate::fmt_http_date(t)),
+            (false, Some(t)) => println!("    Remove: tiles older than {}", httpdate::fmt_http_date(t.max(SystemTime::UNIX_EPOCH))),
             (false, None) => println!("    Remove: all tiles"),
         }
 

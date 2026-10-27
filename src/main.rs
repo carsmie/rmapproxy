@@ -1,5 +1,6 @@
 //! rMapproxy: the MapProxy features tnt-mapproxy uses, in Rust (see SCOPE.md).
 
+mod admin;
 mod cache;
 mod config;
 mod coverage;
@@ -24,6 +25,8 @@ use anyhow::{Context, Result, anyhow, bail};
 const USAGE: &str = "\
 rmapproxy check -f mapproxy.yaml                       load the configuration and print a summary
 rmapproxy serve -f mapproxy.yaml [--bind ADDR]           WMTS on ADDR (default 0.0.0.0:8080)
+                [--admin [--seed-conf seed.yaml] [--admin-assets DIR]]
+                                                       plus the /_admin API and GUI (DIR, default ./admin)
 rmapproxy seed  -f mapproxy.yaml -s seed.yaml (--seed a,b | --cleanup a,b) [-c N]
                 [--progress-file F [--continue]] [--log-config X (ignored)]
                                                        mapproxy-seed subset; also runs as `mapproxy-seed`
@@ -71,7 +74,20 @@ fn main() -> Result<()> {
             let cfg = Arc::new(config::Config::load(&cfg_path)?);
             let mgr = Arc::new(tile::TileManager::new(cfg)?);
             let bind = flag("--bind").unwrap_or_else(|| "0.0.0.0:8080".into());
-            rt.block_on(server::serve(mgr, &bind))
+            // Absolute: seed children run in the admin's state directory.
+            let admin = has("--admin")
+                .then(|| -> Result<admin::AdminOpts> {
+                    let dir = cfg_path.parent().unwrap_or(std::path::Path::new("."));
+                    let seed_conf = flag("--seed-conf").map(PathBuf::from).unwrap_or_else(|| dir.join("seed.yaml"));
+                    let assets = flag("--admin-assets").map(PathBuf::from).unwrap_or_else(|| dir.join("admin"));
+                    Ok(admin::AdminOpts {
+                        mapproxy_conf: std::path::absolute(&cfg_path)?,
+                        seed_conf: std::path::absolute(seed_conf)?,
+                        assets: std::path::absolute(assets)?,
+                    })
+                })
+                .transpose()?;
+            rt.block_on(server::serve(mgr, &bind, admin))
         }
         Some("seed") => {
             let cfg = Arc::new(config::Config::load(&cfg_path)?);

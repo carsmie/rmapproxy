@@ -47,6 +47,10 @@ files, WMTS GetTile KVP + REST + GetCapabilities, CORS/cache headers, seeding (T
 order, coverage, levels, refresh_before / overwrite-all, `-c`), `--cleanup` (incl. complete
 extent), `--progress-file` (pickle readable by tnt-mapproxy's admin) + `--continue`. Invoked
 as `mapproxy-seed` it behaves as the seed command. Static musl `Dockerfile` (rustls).
+`serve --admin [--seed-conf seed.yaml] [--admin-assets DIR]` adds the cache-admin API on
+`/_admin/*` (`src/admin.rs`: seed/cleanup jobs as child processes with stop/continue, estimates,
+other seeders' progress files, cache statistics, legends, history); the GUI lives in
+tnt-rmapproxy's `admin/`.
 
 2026-10-26, against MapProxy 7.0 with a deterministic fake WMS (RGBA, paletted+tRNS, opaque
 RGB, polygon coverage sub-queries):
@@ -67,8 +71,7 @@ change tiles relative to MapProxy.
 1. `fastoctree` quantizer (MapProxy's default, only `qgis_hoydekurve_cache` uses it): written
    as RGBA with a warning.
 2. WMS GetFeatureInfo / GetLegendGraphic / `tiled=true` (WMS-C); JPEG is encoded with
-   `jpeg-encoder` (not byte-identical to Pillow's libjpeg); the `/demo` UI; the admin GUI
-   (stays in tnt-mapproxy).
+   `jpeg-encoder` (not byte-identical to Pillow's libjpeg); the `/demo` UI.
 3. Seeding: `refresh_before.time/mtime`, multiple coverages per task.
 
 Deployment: [kartverket/tnt-rmapproxy](https://github.com/kartverket/tnt-rmapproxy) builds a

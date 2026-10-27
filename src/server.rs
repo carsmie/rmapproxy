@@ -26,7 +26,7 @@ struct App {
     wms: Option<Arc<crate::wms::Wms>>,
 }
 
-pub async fn serve(mgr: Arc<TileManager>, bind: &str) -> anyhow::Result<()> {
+pub async fn serve(mgr: Arc<TileManager>, bind: &str, admin: Option<crate::admin::AdminOpts>) -> anyhow::Result<()> {
     let mut layers = HashMap::new();
     for l in &mgr.cfg.layers {
         match l.sources.as_slice() {
@@ -37,8 +37,9 @@ pub async fn serve(mgr: Arc<TileManager>, bind: &str) -> anyhow::Result<()> {
         }
     }
     let wms = crate::wms::Wms::new(mgr.clone()).map(Arc::new);
+    let admin = admin.map(|o| crate::admin::Admin::new(mgr.clone(), o)).transpose()?;
     let app = App { mgr, layers: Arc::new(layers), wms };
-    let router = Router::new()
+    let mut router = Router::new()
         .route("/service", get(kvp))
         .route("/wmts", get(kvp))
         .route("/wms", get(wms_path))
@@ -47,9 +48,13 @@ pub async fn serve(mgr: Arc<TileManager>, bind: &str) -> anyhow::Result<()> {
         .route("/legend/{file}", get(legend))
         .route("/healthz", get(|| async { "ok\n" }))
         .fallback(|| async { ows_error(StatusCode::NOT_FOUND, "NotFound", "unknown path") })
-        .layer(axum::middleware::from_fn(cors))
-        .layer(axum::middleware::from_fn(access_log))
         .with_state(app);
+    // `serve --admin` only: the serving replicas never expose /_admin.
+    if let Some(a) = admin {
+        info!("admin API on /_admin");
+        router = router.merge(crate::admin::router(a));
+    }
+    let router = router.layer(axum::middleware::from_fn(cors)).layer(axum::middleware::from_fn(access_log));
     let listener = tokio::net::TcpListener::bind(bind).await?;
     info!("listening on {bind}");
     axum::serve(listener, router).await?;
