@@ -98,6 +98,20 @@ impl FileCache {
                 let _ = (&f).write_all(format!(" {}\n", std::process::id()).as_bytes());
                 return Ok(TileLock { path, _file: f });
             }
+            // Only EWOULDBLOCK means "held by another process". An NFS mount whose lock manager
+            // is unreachable from this node fails every flock (ENOLCK): waiting would time out on
+            // every metatile, so render unlocked — the cache's `nolock` NFS never coordinated
+            // across nodes anyway, and tiles are written by atomic rename.
+            let err = std::io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(libc::EWOULDBLOCK) | Some(libc::EINTR) => {}
+                Some(libc::ENOLCK) | Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS) => {
+                    static WARNED: std::sync::Once = std::sync::Once::new();
+                    WARNED.call_once(|| tracing::warn!("tile locks unavailable in {} ({err}); rendering without locks", self.lock_dir.display()));
+                    return Ok(TileLock { path, _file: f });
+                }
+                _ => return Err(err).with_context(|| format!("locking {}", path.display())),
+            }
             if Instant::now() >= deadline {
                 bail!("lock timeout {}", path.display());
             }

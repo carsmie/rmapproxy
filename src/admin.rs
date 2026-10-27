@@ -87,7 +87,12 @@ struct WorkerInfo {
     chunks_done: u64,
     tiles: u64,
     busy_secs: f64,
+    /// Consecutive chunks in which every metatile failed (a broken pod, e.g. no NFS locks).
+    bad_streak: u32,
 }
+
+/// After this many all-failed chunks in a row a worker gets no more chunks.
+const QUARANTINE_STREAK: u32 = 2;
 
 /// A worker that has not called in for this long is not listed as connected.
 const WORKER_SEEN_SECS: u64 = 60;
@@ -1005,7 +1010,7 @@ impl Admin {
     fn seen(&self, worker: &str, job: Option<&str>, chunk: Option<usize>) {
         let mut ws = self.workers.lock();
         ws.retain(|_, w| w.last_seen.elapsed().as_secs() < 600);
-        let w = ws.entry(worker.to_string()).or_insert(WorkerInfo { last_seen: Instant::now(), job: None, chunk: None, chunks_done: 0, tiles: 0, busy_secs: 0.0 });
+        let w = ws.entry(worker.to_string()).or_insert(WorkerInfo { last_seen: Instant::now(), job: None, chunk: None, chunks_done: 0, tiles: 0, busy_secs: 0.0, bad_streak: 0 });
         w.last_seen = Instant::now();
         w.job = job.map(String::from);
         w.chunk = chunk;
@@ -1013,6 +1018,10 @@ impl Admin {
 
     /// Next chunk of the oldest running distributed job.
     fn claim(&self, worker: &str) -> Option<Json> {
+        if self.workers.lock().get(worker).is_some_and(|w| w.bad_streak >= QUARANTINE_STREAK) {
+            self.seen(worker, None, None);
+            return None;
+        }
         let mut jobs = self.jobs.lock();
         for j in jobs.iter_mut().filter(|j| j.state == "running") {
             let Some(q) = j.queue.as_mut() else { continue };
@@ -1106,6 +1115,14 @@ impl Admin {
         {
             let mut ws = self.workers.lock();
             if let Some(w) = ws.get_mut(worker) {
+                let metas = b["metatiles"].as_u64().unwrap_or(0);
+                w.bad_streak = if errors > 0 && errors >= metas { w.bad_streak + 1 } else { 0 };
+                if w.bad_streak == QUARANTINE_STREAK {
+                    warn!("admin: worker {worker}: {QUARANTINE_STREAK} chunks in a row failed completely; no more chunks for it");
+                    if let Some(j) = self.jobs.lock().iter_mut().find(|j| j.id == job) {
+                        j.log.push_back(format!("{worker}: {QUARANTINE_STREAK} chunks på rad feilet helt; får ikke flere chunks (slett poden)."));
+                    }
+                }
                 w.chunks_done += 1;
                 w.tiles += tiles;
                 w.busy_secs += b["seconds"].as_f64().unwrap_or(0.0);
@@ -1138,6 +1155,7 @@ impl Admin {
                     "name": name, "last_seen_seconds": w.last_seen.elapsed().as_secs(),
                     "connected": w.last_seen.elapsed().as_secs() < WORKER_SEEN_SECS,
                     "job": w.job, "chunk": w.chunk, "chunks_done": w.chunks_done, "tiles": w.tiles,
+                    "quarantined": w.bad_streak >= QUARANTINE_STREAK,
                     "tiles_per_second": (w.busy_secs > 0.0).then(|| w.tiles as f64 / w.busy_secs),
                 })
             })
