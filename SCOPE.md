@@ -31,7 +31,9 @@ below point into its `mapproxy/` package.
 * tnt-mapproxy's Python admin app as such. `serve --admin` (`src/admin.rs`) is its rework for
   rMapproxy: job API on `/_admin/*` (seed/cleanup jobs as `rmapproxy seed` children, stop/continue,
   estimates, other processes' progress files, cache statistics, legends, `.seed_history.json`);
-  the GUI files come from `--admin-assets` (tnt-rmapproxy's `admin/`).
+  the GUI files come from `--admin-assets` (tnt-rmapproxy's `admin/`). Distributed seeding
+  (`seed-worker`, `src/work.rs`) has no MapProxy counterpart; it reuses the seeder's per-metatile
+  code and TileWalker metatile set, only the order differs.
 
 ## Parity rules
 

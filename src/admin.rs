@@ -4,7 +4,8 @@
 //! `<base_dir>/.rmapproxy-admin/`, so a stopped, failed or interrupted (pod restart) job can be
 //! continued. Other processes' `<base_dir>/.mapproxy_seed_progress.*` files (SKIPJobs,
 //! tnt-mapproxy's admin) are listed read-only. History stays in tnt-mapproxy's
-//! `.seed_history.json` format.
+//! `.seed_history.json` format. A seed job can instead be distributed: split into chunks that
+//! `rmapproxy seed-worker` pods lease over `/_admin/work/*` (`work.rs`).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::os::unix::fs::MetadataExt;
@@ -31,6 +32,7 @@ use crate::cache::write_atomic;
 use crate::config::load_yaml_with_bases;
 use crate::seed::{self, Mode};
 use crate::tile::TileManager;
+use crate::work::Queue;
 
 const LOG_MAX: usize = 400;
 const LOG_LINE_MAX: usize = 2000;
@@ -74,7 +76,21 @@ pub struct Admin {
     stats_kick: tokio::sync::Notify,
     legends_running: AtomicBool,
     legends_last: Mutex<Option<Json>>,
+    /// Seed workers by name, from their claims/heartbeats.
+    workers: Mutex<HashMap<String, WorkerInfo>>,
 }
+
+struct WorkerInfo {
+    last_seen: Instant,
+    job: Option<String>,
+    chunk: Option<usize>,
+    chunks_done: u64,
+    tiles: u64,
+    busy_secs: f64,
+}
+
+/// A worker that has not called in for this long is not listed as connected.
+const WORKER_SEEN_SECS: u64 = 60;
 
 #[derive(Default)]
 struct Stats {
@@ -107,6 +123,9 @@ struct Job {
     errors: u64,
     /// Last progress read from the job's progress sidecar.
     progress: Vec<TaskProgress>,
+    /// Distributed job: its chunks (no local process).
+    queue: Option<Queue>,
+    last_persist: Instant,
 }
 
 #[derive(Clone)]
@@ -266,6 +285,7 @@ impl Admin {
             stats_kick: tokio::sync::Notify::new(),
             legends_running: AtomicBool::new(false),
             legends_last: Mutex::new(None),
+            workers: Mutex::new(HashMap::new()),
         });
         admin.load_records();
         Ok(admin)
@@ -282,6 +302,31 @@ impl Admin {
             }
             let Some(r) = std::fs::read_to_string(&p).ok().and_then(|t| serde_json::from_str::<Json>(&t).ok()) else { continue };
             let Some(mut job) = Job::from_record(&r) else { continue };
+            if r["distributed"] == true {
+                // Chunks are rebuilt from the job configuration; running jobs keep running (the
+                // workers carry on, their leases are re-adopted on the next heartbeat).
+                match self.make_queue(&job.id, &job.names) {
+                    Ok(mut q) if q.len() as u64 == r["chunks"].as_u64().unwrap_or(0) => {
+                        q.restore(&r["chunks_done"], &r["chunks_failed"]);
+                        q.tiles = job.tiles;
+                        q.errors = job.errors;
+                        job.queue = Some(q);
+                        if job.state == "stopping" {
+                            job.state = "stopped";
+                        }
+                    }
+                    Ok(_) => {
+                        warn!("admin: job {}: chunk layout changed, not loaded", job.id);
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!("admin: job {}: {e:#}", job.id);
+                        continue;
+                    }
+                }
+                jobs.push(job);
+                continue;
+            }
             if matches!(job.state, "running" | "stopping") {
                 // Died with the old pod: about when it last wrote progress.
                 let pp = self.progress_path(&job.id);
@@ -297,6 +342,11 @@ impl Admin {
         jobs.sort_by(|a, b| a.created_at.cmp(&b.created_at));
         info!("admin: {} unfinished job(s) in {}", jobs.len(), self.dir.display());
         *self.jobs.lock() = jobs;
+    }
+
+    fn make_queue(&self, id: &str, names: &[String]) -> Result<Queue> {
+        let conf = load_yaml_with_bases(&self.job_conf_path(id))?;
+        Queue::build(&seed::load_tasks_from(&self.mgr, &conf, &self.dir, names, Mode::Seed)?)
     }
 
     fn job_conf_path(&self, id: &str) -> PathBuf {
@@ -504,8 +554,9 @@ impl Admin {
         Ok((Yaml::Mapping(root), names, Json::Array(norm), refresh))
     }
 
+    /// Local (in-pod) jobs running; distributed jobs run on the workers and don't count.
     fn running_count(&self) -> usize {
-        self.jobs.lock().iter().filter(|j| matches!(j.state, "running" | "stopping")).count()
+        self.jobs.lock().iter().filter(|j| j.queue.is_none() && matches!(j.state, "running" | "stopping")).count()
     }
 
     /// Tasks of the new job that another (own or external, fresh) seed works on right now.
@@ -549,7 +600,15 @@ impl Admin {
         };
         let (conf, names, tasks, refresh) = self.build_conf(req, mode)?;
         // Validate like the child will (unknown caches/grids/coverages fail here, not in the job).
-        seed::load_tasks_from(&self.mgr, &conf, &self.dir, &names, mode)?;
+        let seed_tasks = seed::load_tasks_from(&self.mgr, &conf, &self.dir, &names, mode)?;
+        let distributed = req["distributed"] == true;
+        if distributed && mode != Mode::Seed {
+            bail!("sletting kjøres i admin-poden, ikke på arbeiderne");
+        }
+        if !distributed && self.running_count() >= self.max_jobs {
+            bail!("maks {} samtidige jobber i admin-poden kjører allerede", self.max_jobs);
+        }
+        let queue = if distributed { Some(Queue::build(&seed_tasks)?) } else { None };
         let concurrency = req["concurrency"].as_u64().map_or(self.concurrency, |c| (c as usize).clamp(1, 64));
         let warning = self.overlap_warning(&names);
         let id = self.new_id(mode);
@@ -576,7 +635,23 @@ impl Admin {
             task_tiles: 0,
             errors: 0,
             progress: vec![],
+            queue,
+            last_persist: Instant::now(),
         };
+        if let Some((n, est)) = job.queue.as_ref().map(|q| (q.len(), q.est_total)) {
+            let mut job = job;
+            job.runs = 1;
+            job.log.push_back(format!("Fordelt: {n} chunks (~{est} metafliser) til seed-arbeiderne."));
+            self.persist(&job);
+            self.jobs.lock().push(job);
+            let mut out = json!({ "id": id, "message": format!("Jobb {id} startet, fordelt på {n} chunks.") });
+            if self.workers_connected() == 0 {
+                out["warning"] = "Ingen seed-arbeidere er tilkoblet; jobben venter til en kobler seg på.".into();
+            } else if let Some(w) = warning {
+                out["warning"] = w.into();
+            }
+            return Ok(out);
+        }
         self.jobs.lock().push(job);
         if let Err(e) = self.launch(&id) {
             self.jobs.lock().retain(|j| j.id != id);
@@ -731,6 +806,21 @@ impl Admin {
         let pid = {
             let mut jobs = self.jobs.lock();
             let Some(j) = jobs.iter_mut().find(|j| j.id == id) else { return msg(StatusCode::NOT_FOUND, "Ukjent jobb.") };
+            if let Some(q) = j.queue.as_mut() {
+                if j.state != "running" {
+                    return msg(StatusCode::CONFLICT, "Jobben kjører ikke.");
+                }
+                // Workers lose their leases on the next heartbeat and drop their chunks.
+                q.release_all();
+                j.state = "stopped";
+                j.finished_at = Some(SystemTime::now());
+                j.tiles = q.tiles;
+                j.errors = q.errors;
+                j.log.push_back("Stoppet; arbeiderne slipper chunkene sine.".into());
+                self.append_history(j);
+                self.persist(j);
+                return msg(StatusCode::OK, "Jobben er stoppet. Den kan fortsettes senere.");
+            }
             match (j.state, j.pid) {
                 ("running", Some(pid)) => {
                     j.state = "stopping";
@@ -754,6 +844,25 @@ impl Admin {
     }
 
     fn resume(self: &Arc<Self>, id: &str) -> Response {
+        {
+            let mut jobs = self.jobs.lock();
+            if let Some(j) = jobs.iter_mut().find(|j| j.id == id && j.queue.is_some()) {
+                if !matches!(j.state, "stopped" | "failed" | "interrupted") {
+                    return msg(StatusCode::CONFLICT, "Bare stoppede eller feilede jobber kan fortsettes.");
+                }
+                let q = j.queue.as_mut().expect("distributed");
+                let retried = q.failed;
+                q.retry_failed();
+                j.state = "running";
+                j.runs += 1;
+                j.run_started_at = SystemTime::now();
+                j.run_started = Instant::now();
+                j.finished_at = None;
+                j.log.push_back(format!("Fortsetter: {} chunks igjen ({retried} feilede prøves på nytt).", q.len() - q.done));
+                self.persist(j);
+                return msg(StatusCode::OK, format!("Jobb {id} fortsetter på arbeiderne."));
+            }
+        }
         if self.running_count() >= self.max_jobs {
             return msg(StatusCode::CONFLICT, format!("Maks {} samtidige jobber kjører allerede.", self.max_jobs));
         }
@@ -793,6 +902,9 @@ impl Admin {
     }
 
     fn job_json(&self, j: &mut Job, with_log: bool) -> Json {
+        if j.queue.is_some() {
+            return self.distributed_json(j, with_log);
+        }
         if matches!(j.state, "running" | "stopping") {
             if let Some(p) = read_progress(&self.progress_path(&j.id)) {
                 j.progress = p;
@@ -831,6 +943,207 @@ impl Admin {
             v["log"] = json!(j.log.iter().collect::<Vec<_>>());
         }
         v
+    }
+
+    fn distributed_json(&self, j: &mut Job, with_log: bool) -> Json {
+        let running = j.state == "running";
+        for (i, w) in j.queue.as_mut().map(|q| q.expire()).unwrap_or_default() {
+            j.log.push_back(format!("Chunk {i}: {w} svarte ikke; legges tilbake i køen."));
+        }
+        let q = j.queue.as_ref().expect("distributed");
+        let levels = |name: &str| {
+            j.tasks.as_array().into_iter().flatten().find(|t| t["name"] == name).map(|t| json!([t["levels_from"], t["levels_to"]])).unwrap_or(json!([null, null]))
+        };
+        let progress: Vec<Json> = q
+            .tasks
+            .iter()
+            .zip(&q.per_task)
+            .map(|((name, cache, grid), (d, t))| json!({ "name": name, "cache": cache, "grid": grid, "levels": levels(name), "done": d, "total": t }))
+            .collect();
+        let duration = match j.finished_at {
+            Some(f) => f.duration_since(j.run_started_at).map(|d| d.as_secs()).unwrap_or(0),
+            None => j.run_started.elapsed().as_secs(),
+        };
+        let leased = q.leased_count();
+        let mut v = json!({
+            "id": j.id,
+            "mode": mode_str(j.mode),
+            "state": j.state,
+            "distributed": { "chunks": q.len(), "done": q.done, "failed": q.failed, "leased": leased },
+            "pid": null,
+            "created_at": iso(j.created_at),
+            "started_at": iso(j.run_started_at),
+            "finished_at": j.finished_at.map(iso),
+            "duration_seconds": duration,
+            "exit_code": j.exit_code,
+            "tasks": j.tasks,
+            "refresh": j.refresh,
+            "concurrency": j.concurrency,
+            "runs": j.runs,
+            "tiles": q.tiles + q.inflight_tiles(),
+            "errors": q.errors,
+            "percent": if q.est_total == 0 { 100.0 } else { 100.0 * q.est_done as f64 / q.est_total as f64 },
+            "current_task": null,
+            "progress": progress,
+            "last_activity_age_seconds": age(j.last_activity),
+            "stalled": false,
+            "waiting_for_workers": running && leased == 0 && !q.finished(),
+            "resumable": matches!(j.state, "stopped" | "failed" | "interrupted"),
+        });
+        if with_log {
+            v["log"] = json!(j.log.iter().collect::<Vec<_>>());
+        }
+        v
+    }
+
+    // ── seed workers (`/_admin/work/*`) ─────────────────────────────────────
+
+    fn workers_connected(&self) -> usize {
+        self.workers.lock().values().filter(|w| w.last_seen.elapsed().as_secs() < WORKER_SEEN_SECS).count()
+    }
+
+    fn seen(&self, worker: &str, job: Option<&str>, chunk: Option<usize>) {
+        let mut ws = self.workers.lock();
+        ws.retain(|_, w| w.last_seen.elapsed().as_secs() < 600);
+        let w = ws.entry(worker.to_string()).or_insert(WorkerInfo { last_seen: Instant::now(), job: None, chunk: None, chunks_done: 0, tiles: 0, busy_secs: 0.0 });
+        w.last_seen = Instant::now();
+        w.job = job.map(String::from);
+        w.chunk = chunk;
+    }
+
+    /// Next chunk of the oldest running distributed job.
+    fn claim(&self, worker: &str) -> Option<Json> {
+        let mut jobs = self.jobs.lock();
+        for j in jobs.iter_mut().filter(|j| j.state == "running") {
+            let Some(q) = j.queue.as_mut() else { continue };
+            for (i, w) in q.expire() {
+                j.log.push_back(format!("Chunk {i}: {w} svarte ikke; legges tilbake i køen."));
+            }
+            let Some((i, c)) = q.claim(worker) else { continue };
+            let (name, cache, grid) = q.tasks[c.task as usize].clone();
+            let conf = match std::fs::read_to_string(self.job_conf_path(&j.id)) {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!("admin: job {}: {e}", j.id);
+                    q.release(i);
+                    continue;
+                }
+            };
+            j.last_activity = SystemTime::now();
+            let out = json!({
+                "job": j.id, "chunk": i, "task": c.task, "name": name, "cache": cache, "grid": grid,
+                "z": c.z, "mx": [c.mx.0, c.mx.1], "my": [c.my.0, c.my.1], "concurrency": j.concurrency,
+                "names": j.names, "conf": conf,
+            });
+            let id = j.id.clone();
+            drop(jobs);
+            self.seen(worker, Some(&id), Some(i));
+            return Some(out);
+        }
+        drop(jobs);
+        self.seen(worker, None, None);
+        None
+    }
+
+    fn heartbeat(&self, b: &Json) -> Json {
+        let (worker, job, chunk) = (b["worker"].as_str().unwrap_or("?"), b["job"].as_str().unwrap_or_default(), b["chunk"].as_u64().unwrap_or(u64::MAX) as usize);
+        let keep = {
+            let mut jobs = self.jobs.lock();
+            match jobs.iter_mut().find(|j| j.id == job && j.state == "running") {
+                Some(j) => {
+                    j.last_activity = SystemTime::now();
+                    j.queue.as_mut().is_some_and(|q| q.heartbeat(chunk, worker, b["done"].as_u64().unwrap_or(0), b["tiles"].as_u64().unwrap_or(0)))
+                }
+                None => false,
+            }
+        };
+        self.seen(worker, Some(job), Some(chunk));
+        json!({ "keep": keep })
+    }
+
+    fn complete(&self, b: &Json) {
+        let (worker, job, chunk) = (b["worker"].as_str().unwrap_or("?"), b["job"].as_str().unwrap_or_default(), b["chunk"].as_u64().unwrap_or(u64::MAX) as usize);
+        let (tiles, errors) = (b["tiles"].as_u64().unwrap_or(0), b["errors"].as_u64().unwrap_or(0));
+        let mut finished = false;
+        {
+            let mut jobs = self.jobs.lock();
+            let Some(j) = jobs.iter_mut().find(|j| j.id == job) else { return };
+            let Some(q) = j.queue.as_mut() else { return };
+            if !q.complete(chunk, tiles, errors) {
+                return;
+            }
+            j.last_activity = SystemTime::now();
+            if errors > 0 {
+                j.log.push_back(format!("Chunk {chunk} ({worker}): {errors} feil av {} metafliser", b["metatiles"]));
+                for m in b["messages"].as_array().into_iter().flatten().filter_map(|m| m.as_str()) {
+                    j.log.push_back(format!("  {m}"));
+                }
+            }
+            while j.log.len() > LOG_MAX {
+                j.log.pop_front();
+            }
+            j.tiles = q.tiles;
+            j.errors = q.errors;
+            if q.finished() && j.state == "running" {
+                let failed = q.failed;
+                j.state = if failed == 0 { "done" } else { "failed" };
+                j.exit_code = Some(if failed == 0 { 0 } else { 1 });
+                j.finished_at = Some(SystemTime::now());
+                j.log.push_back(format!("Ferdig: {} fliser, {} feilede chunks.", j.tiles, failed));
+                info!("admin: distributed job {job} {} ({} tiles, {failed} failed chunks)", j.state, j.tiles);
+                self.append_history(j);
+                if failed == 0 {
+                    self.remove_files(job);
+                } else {
+                    self.persist(j);
+                }
+                finished = true;
+            } else if j.last_persist.elapsed() > Duration::from_secs(5) {
+                j.last_persist = Instant::now();
+                self.persist(j);
+            }
+        }
+        {
+            let mut ws = self.workers.lock();
+            if let Some(w) = ws.get_mut(worker) {
+                w.chunks_done += 1;
+                w.tiles += tiles;
+                w.busy_secs += b["seconds"].as_f64().unwrap_or(0.0);
+                w.last_seen = Instant::now();
+                w.chunk = None;
+            }
+        }
+        if finished {
+            self.stats_kick.notify_one();
+        }
+    }
+
+    fn release(&self, b: &Json) {
+        let (job, chunk) = (b["job"].as_str().unwrap_or_default(), b["chunk"].as_u64().unwrap_or(u64::MAX) as usize);
+        if let Some(q) = self.jobs.lock().iter_mut().find(|j| j.id == job).and_then(|j| j.queue.as_mut()) {
+            if chunk < q.len() {
+                q.release(chunk);
+            }
+        }
+        self.seen(b["worker"].as_str().unwrap_or("?"), None, None);
+    }
+
+    fn workers_json(&self) -> Json {
+        let mut ws: Vec<Json> = self
+            .workers
+            .lock()
+            .iter()
+            .map(|(name, w)| {
+                json!({
+                    "name": name, "last_seen_seconds": w.last_seen.elapsed().as_secs(),
+                    "connected": w.last_seen.elapsed().as_secs() < WORKER_SEEN_SECS,
+                    "job": w.job, "chunk": w.chunk, "chunks_done": w.chunks_done, "tiles": w.tiles,
+                    "tiles_per_second": (w.busy_secs > 0.0).then(|| w.tiles as f64 / w.busy_secs),
+                })
+            })
+            .collect();
+        ws.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+        Json::Array(ws)
     }
 
     // ── other processes' progress files ─────────────────────────────────────
@@ -1009,6 +1322,8 @@ impl Admin {
             "instance": std::env::var("TOPO_CLUSTER").ok(),
             "jobs": jobs,
             "external": self.externals(),
+            "workers": self.workers_json(),
+            "workers_connected": self.workers_connected(),
             "max_jobs": self.max_jobs,
             "default_concurrency": self.concurrency,
             "stall_threshold_seconds": STALL_SECS,
@@ -1027,13 +1342,20 @@ impl Admin {
 
 impl Job {
     fn record(&self) -> Json {
-        json!({
+        let mut r = json!({
             "id": self.id, "mode": mode_str(self.mode), "tasks": self.tasks, "names": self.names,
             "refresh": self.refresh, "concurrency": self.concurrency,
             "created_at": secs(self.created_at), "run_started_at": secs(self.run_started_at),
             "finished_at": self.finished_at.map(secs), "exit_code": self.exit_code, "state": self.state,
             "runs": self.runs, "tiles": self.tiles, "errors": self.errors,
-        })
+        });
+        if let Some(q) = &self.queue {
+            r["distributed"] = true.into();
+            r["chunks"] = q.len().into();
+            r["chunks_done"] = q.ranges(false);
+            r["chunks_failed"] = q.ranges(true);
+        }
+        r
     }
 
     fn from_record(r: &Json) -> Option<Job> {
@@ -1067,6 +1389,8 @@ impl Job {
             task_tiles: 0,
             errors: r["errors"].as_u64().unwrap_or(0),
             progress: vec![],
+            queue: None,
+            last_persist: Instant::now(),
         })
     }
 }
@@ -1368,6 +1692,10 @@ pub fn router(admin: Arc<Admin>) -> Router {
             "/_admin/external/{key}/discard",
             post(|State(a): State<Arc<Admin>>, UrlPath(k): UrlPath<String>| async move { a.discard_external(&k) }),
         )
+        .route("/_admin/work/claim", post(work_claim))
+        .route("/_admin/work/heartbeat", post(work_heartbeat))
+        .route("/_admin/work/complete", post(work_complete))
+        .route("/_admin/work/release", post(work_release))
         .route("/_admin/stats/refresh", post(stats_refresh))
         .route("/_admin/legends", post(legends))
         .route("/_admin/{file}", get(asset))
@@ -1426,12 +1754,14 @@ async fn start(State(a): State<Arc<Admin>>, body: Bytes) -> Response {
         Ok(r) => r,
         Err(r) => return r,
     };
-    if a.running_count() >= a.max_jobs {
-        return msg(StatusCode::CONFLICT, format!("Maks {} samtidige jobber kjører allerede. Stopp en av dem først.", a.max_jobs));
+    if req["distributed"] != true && a.running_count() >= a.max_jobs {
+        return msg(StatusCode::CONFLICT, format!("Maks {} samtidige jobber kjører allerede i admin-poden. Stopp en av dem, eller fordel jobben på arbeiderne.", a.max_jobs));
     }
-    match a.start(&req) {
-        Ok(v) => resp(StatusCode::OK, v),
-        Err(e) => msg(StatusCode::BAD_REQUEST, format!("Kunne ikke starte: {e:#}")),
+    // Chunking a national job tests ~10⁵–10⁶ blocks against the coverage: off the runtime.
+    match tokio::task::spawn_blocking(move || a.start(&req)).await {
+        Ok(Ok(v)) => resp(StatusCode::OK, v),
+        Ok(Err(e)) => msg(StatusCode::BAD_REQUEST, format!("Kunne ikke starte: {e:#}")),
+        Err(e) => msg(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
 
@@ -1440,6 +1770,47 @@ async fn job(State(a): State<Arc<Admin>>, UrlPath(id): UrlPath<String>) -> Respo
     match jobs.iter_mut().find(|j| j.id == id) {
         Some(j) => resp(StatusCode::OK, a.job_json(j, true)),
         None => msg(StatusCode::NOT_FOUND, "Ukjent jobb."),
+    }
+}
+
+async fn work_claim(State(a): State<Arc<Admin>>, body: Bytes) -> Response {
+    let req = match parse_body(&body) {
+        Ok(r) => r,
+        Err(r) => return r,
+    };
+    let Some(worker) = req["worker"].as_str().filter(|w| !w.is_empty() && w.len() <= 100) else {
+        return msg(StatusCode::BAD_REQUEST, "worker mangler");
+    };
+    match a.claim(worker) {
+        Some(c) => resp(StatusCode::OK, c),
+        None => StatusCode::NO_CONTENT.into_response(),
+    }
+}
+
+async fn work_heartbeat(State(a): State<Arc<Admin>>, body: Bytes) -> Response {
+    match parse_body(&body) {
+        Ok(b) => resp(StatusCode::OK, a.heartbeat(&b)),
+        Err(r) => r,
+    }
+}
+
+async fn work_complete(State(a): State<Arc<Admin>>, body: Bytes) -> Response {
+    match parse_body(&body) {
+        Ok(b) => {
+            a.complete(&b);
+            resp(StatusCode::OK, json!({}))
+        }
+        Err(r) => r,
+    }
+}
+
+async fn work_release(State(a): State<Arc<Admin>>, body: Bytes) -> Response {
+    match parse_body(&body) {
+        Ok(b) => {
+            a.release(&b);
+            resp(StatusCode::OK, json!({}))
+        }
+        Err(r) => r,
     }
 }
 

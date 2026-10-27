@@ -16,6 +16,7 @@ mod srs;
 mod tile;
 mod transform;
 mod wms;
+mod work;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -30,6 +31,9 @@ rmapproxy serve -f mapproxy.yaml [--bind ADDR]           WMTS on ADDR (default 0
 rmapproxy seed  -f mapproxy.yaml -s seed.yaml (--seed a,b | --cleanup a,b) [-c N]
                 [--progress-file F [--continue]] [--log-config X (ignored)]
                                                        mapproxy-seed subset; also runs as `mapproxy-seed`
+rmapproxy seed-worker -f mapproxy.yaml --admin URL [--name NAME] [--bind ADDR]
+                                                       render chunks of distributed admin jobs until SIGTERM
+                                                       (/healthz on ADDR, default 0.0.0.0:8080)
 rmapproxy tile  -f mapproxy.yaml --cache C --grid G Z/X/Y [-o out.png] [--no-store]
                                                        render (or load) one tile
 ";
@@ -103,6 +107,14 @@ fn main() -> Result<()> {
             let progress = flag("--progress-file").map(|p| seed::Progress::new(PathBuf::from(p), has("--continue")));
             let tasks = seed::load_tasks(&mgr, &seed_conf, &names, mode)?;
             rt.block_on(seed::run(mgr, tasks, mode, conc, progress))
+        }
+        Some("seed-worker") => {
+            let cfg = Arc::new(config::Config::load(&cfg_path)?);
+            let mgr = Arc::new(tile::TileManager::new(cfg)?);
+            let admin_url = flag("--admin").context("--admin URL")?;
+            let name = flag("--name").or_else(|| std::env::var("HOSTNAME").ok()).unwrap_or_else(|| "worker".into());
+            let bind = flag("--bind").unwrap_or_else(|| "0.0.0.0:8080".into());
+            rt.block_on(work::run_worker(mgr, admin_url, name, bind))
         }
         Some("tile") => {
             let cfg = Arc::new(config::Config::load(&cfg_path)?);

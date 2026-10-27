@@ -50,7 +50,11 @@ as `mapproxy-seed` it behaves as the seed command. Static musl `Dockerfile` (rus
 `serve --admin [--seed-conf seed.yaml] [--admin-assets DIR]` adds the cache-admin API on
 `/_admin/*` (`src/admin.rs`: seed/cleanup jobs as child processes with stop/continue, estimates,
 other seeders' progress files, cache statistics, legends, history); the GUI lives in
-tnt-rmapproxy's `admin/`.
+tnt-rmapproxy's `admin/`. A seed job can be distributed: the admin splits it into chunks
+(≤16×16 metatiles of one level that touch the coverage) and `rmapproxy seed-worker --admin URL`
+pods lease, render and report them (`src/work.rs`; leases expire after 2 min, SIGTERM hands the
+chunk back). Verified: the chunked job writes exactly the tile set of `rmapproxy seed` for the
+same tasks (3 237/3 237 files, byte-identical, incl. a polygon coverage).
 
 2026-10-26, against MapProxy 7.0 with a deterministic fake WMS (RGBA, paletted+tRNS, opaque
 RGB, polygon coverage sub-queries):

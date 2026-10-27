@@ -228,6 +228,62 @@ fn cleanup_meta(task: &SeedTask, main: TileCoord) -> Result<usize> {
     Ok(n)
 }
 
+/// One metatile of a task: seed (if `needs_work`) under the metatile lock, or clean up.
+/// Shared by `run` and the admin's seed workers.
+pub async fn process_meta(mgr: &Arc<TileManager>, t: &Arc<SeedTask>, main: TileCoord, seeding: bool) -> Result<usize> {
+    if !seeding {
+        let t2 = t.clone();
+        return match tokio::task::spawn_blocking(move || cleanup_meta(&t2, main)).await {
+            Ok(r) => r,
+            Err(e) => Err(anyhow!("{e}")),
+        };
+    }
+    if !needs_work(t, main) {
+        return Ok(0);
+    }
+    let meta = t.cg.meta.meta_tile(main);
+    let lock_cg = t.cg.clone();
+    let _l = tokio::task::spawn_blocking(move || lock_cg.file.lock(main)).await??;
+    // A source error (on_error: transparent) leaves the metatile unstored: MapProxy's seeder
+    // counts that as done; here it is an error, so it shows in the summary/exit code and the
+    // resume point stays before it.
+    match mgr.create_meta(&t.cg, &meta, true).await? {
+        (tiles, true) => Ok(tiles.len()),
+        (_, false) => Err(anyhow!("not stored: a source failed (see the warnings above)")),
+    }
+}
+
+/// Metatile index range `(mx0, mx1, my0, my1)` (main tile = `(mx * ms.0, my * ms.1, z)`) of the
+/// task's coverage extent at level `z`, clipped to the grid: what `affected_level_tiles`
+/// visits, without materialising it (the admin's chunks and estimates).
+pub fn level_meta_range(task: &SeedTask, z: usize) -> Result<Option<(i64, i64, i64, i64)>> {
+    let mg = &task.cg.meta;
+    let g = &mg.grid;
+    let bbox = match &task.coverage {
+        Some(c) => c.extent_bbox_for(&g.srs)?,
+        None => g.bbox,
+    };
+    let delta = g.res[z] / 10.0;
+    let (x0, y0, _) = g.tile_coord_for_point(bbox[0] + delta, bbox[1] + delta, z);
+    let (x1, y1, _) = g.tile_coord_for_point(bbox[2] - delta, bbox[3] - delta, z);
+    let gs = g.grid_sizes[z];
+    let (xa, xb) = (x0.min(x1).max(0), x0.max(x1).min(gs.0 - 1));
+    let (ya, yb) = (y0.min(y1).max(0), y0.max(y1).min(gs.1 - 1));
+    if xa > xb || ya > yb {
+        return Ok(None);
+    }
+    let ms = mg.meta_size(z);
+    Ok(Some((xa.div_euclid(ms.0), xb.div_euclid(ms.0), ya.div_euclid(ms.1), yb.div_euclid(ms.1))))
+}
+
+/// Does metatile `main` touch the task's coverage (the TileWalker's per-level test)?
+pub fn meta_in_coverage(task: &SeedTask, main: TileCoord) -> Result<bool> {
+    match &task.coverage {
+        Some(c) => c.intersects(task.cg.meta.meta_tile(main).bbox, &task.cg.meta.grid.srs),
+        None => Ok(true),
+    }
+}
+
 /// Cleanup without coverage (`complete_extent`): whole level directories.
 fn cleanup_levels(task: &SeedTask) -> Result<usize> {
     let mut n = 0;
@@ -466,29 +522,7 @@ pub async fn run(mgr: Arc<TileManager>, tasks: Vec<SeedTask>, mode: Mode, concur
             let (m, t) = (mgr.clone(), task.clone());
             set.spawn(async move {
                 let _p = permit;
-                let r = if !seeding {
-                    let t2 = t.clone();
-                    match tokio::task::spawn_blocking(move || cleanup_meta(&t2, main)).await {
-                        Ok(r) => r,
-                        Err(e) => Err(anyhow!("{e}")),
-                    }
-                } else if !needs_work(&t, main) {
-                    Ok(0)
-                } else {
-                    let meta = t.cg.meta.meta_tile(main);
-                    let lock_cg = t.cg.clone();
-                    async {
-                        let _l = tokio::task::spawn_blocking(move || lock_cg.file.lock(main)).await??;
-                        // A source error (on_error: transparent) leaves the metatile unstored:
-                        // MapProxy's seeder counts that as done; here it is an error, so it shows
-                        // in the summary/exit code and the resume point stays before it.
-                        match m.create_meta(&t.cg, &meta, true).await? {
-                            (tiles, true) => Ok(tiles.len()),
-                            (_, false) => Err(anyhow!("not stored: a source failed (see the warnings above)")),
-                        }
-                    }
-                    .await
-                };
+                let r = process_meta(&m, &t, main, seeding).await;
                 (i, z, main, r)
             });
             while let Some(r) = set.try_join_next() {
