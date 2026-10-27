@@ -48,13 +48,15 @@ pub async fn serve(mgr: Arc<TileManager>, bind: &str, admin: Option<crate::admin
         .route("/legend/{file}", get(legend))
         .route("/healthz", get(|| async { "ok\n" }))
         .fallback(|| async { ows_error(StatusCode::NOT_FOUND, "NotFound", "unknown path") })
-        .with_state(app);
+        .with_state(app)
+        // The open CORS headers are for the map services only, never for /_admin.
+        .layer(axum::middleware::from_fn(cors));
     // `serve --admin` only: the serving replicas never expose /_admin.
     if let Some(a) = admin {
         info!("admin API on /_admin");
         router = router.merge(crate::admin::router(a));
     }
-    let router = router.layer(axum::middleware::from_fn(cors)).layer(axum::middleware::from_fn(access_log));
+    let router = router.layer(axum::middleware::from_fn(access_log));
     let listener = tokio::net::TcpListener::bind(bind).await?;
     info!("listening on {bind}");
     axum::serve(listener, router).await?;

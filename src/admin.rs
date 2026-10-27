@@ -1717,7 +1717,45 @@ pub fn router(admin: Arc<Admin>) -> Router {
         .route("/_admin/stats/refresh", post(stats_refresh))
         .route("/_admin/legends", post(legends))
         .route("/_admin/{file}", get(asset))
+        .layer(axum::middleware::from_fn(guard))
         .with_state(admin)
+}
+
+/// Request headers that mark a browser request from another site: the admin API is reachable
+/// from operators' browsers, so a page elsewhere must not be able to start or stop jobs.
+fn cross_site(h: &header::HeaderMap) -> bool {
+    let get = |n: &str| h.get(n).and_then(|v| v.to_str().ok());
+    if let Some(site) = get("sec-fetch-site") {
+        return !matches!(site, "same-origin" | "none");
+    }
+    // Browsers without Fetch Metadata: the Origin of a POST has to be this host.
+    match get("origin") {
+        Some(origin) => {
+            let host = get("x-forwarded-host").or_else(|| get("host")).unwrap_or_default();
+            origin.split_once("://").map(|(_, h)| h) != Some(host)
+        }
+        None => false,
+    }
+}
+
+/// `RMAPPROXY_WORKER_TOKEN`, if set: the bearer token seed workers send on `/_admin/work/*`.
+pub fn worker_token() -> Option<String> {
+    std::env::var("RMAPPROXY_WORKER_TOKEN").ok().filter(|t| !t.is_empty())
+}
+
+async fn guard(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    if req.method() != axum::http::Method::GET && cross_site(req.headers()) {
+        return msg(StatusCode::FORBIDDEN, "Forespørsler fra andre nettsteder er ikke tillatt.");
+    }
+    if req.uri().path().starts_with("/_admin/work/")
+        && let Some(token) = worker_token()
+    {
+        let sent = req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
+        if sent != Some(token.as_str()) {
+            return msg(StatusCode::UNAUTHORIZED, "Ugyldig eller manglende arbeider-token.");
+        }
+    }
+    next.run(req).await
 }
 
 fn parse_body(body: &Bytes) -> Result<Json, Response> {
@@ -1879,6 +1917,24 @@ mod tests {
         assert!(valid_id("20261027-101530-seed"));
         assert!(!valid_id("../x") && !valid_id(".hidden") && !valid_id("a/b"));
         assert_eq!(url_escape("a b,c&d"), "a%20b,c%26d");
+    }
+
+    #[test]
+    fn cross_site_requests() {
+        let h = |pairs: &[(&'static str, &'static str)]| {
+            let mut m = header::HeaderMap::new();
+            for (k, v) in pairs {
+                m.insert(*k, v.parse().unwrap());
+            }
+            m
+        };
+        // Workers and curl send neither header.
+        assert!(!cross_site(&h(&[("host", "admin:8080")])));
+        assert!(!cross_site(&h(&[("sec-fetch-site", "same-origin"), ("origin", "https://x")])));
+        assert!(cross_site(&h(&[("sec-fetch-site", "cross-site")])));
+        assert!(cross_site(&h(&[("sec-fetch-site", "same-site")])));
+        assert!(!cross_site(&h(&[("origin", "https://topo.example"), ("host", "pod"), ("x-forwarded-host", "topo.example")])));
+        assert!(cross_site(&h(&[("origin", "https://evil.example"), ("host", "topo.example")])));
     }
 
     #[test]

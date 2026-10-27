@@ -20,6 +20,12 @@ It reads tnt-mapproxy's *rendered* config (`mapproxy.yaml` + `rendered/` as writ
 `entrypoint.sh`, including `rendered/hidpi.yaml`). `RUST_LOG=rmapproxy=debug` logs every
 source URL and per-metatile timings.
 
+`RMAPPROXY_MAX_RENDERS` (default 32, 0 = unbounded) caps the metatiles `serve` renders on
+demand at once; requests for tiles of a metatile already being rendered wait for it.
+`/_admin` sends no CORS headers and refuses non-GET requests from other sites. With
+`RMAPPROXY_WORKER_TOKEN` set on the admin and the workers, `/_admin/work/*` requires it as a
+bearer token.
+
 ## Status (2026-10-26)
 
 Verified against MapProxy 7.0 (tnt-mapproxy image) on the same rendered config and the

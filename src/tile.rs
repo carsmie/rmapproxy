@@ -25,6 +25,33 @@ pub struct CacheGrid {
     pub meta: MetaGrid,
     pub sources: Vec<Arc<WmsSource>>,
     pub image: ImageOpts,
+    /// Metatiles being rendered on demand in this process: requests for tiles of the same
+    /// metatile wait here instead of each polling the flock in a blocking thread.
+    inflight: parking_lot::Mutex<HashMap<TileCoord, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+/// A request's claim on an `inflight` slot; the slot is removed by the last one out.
+struct Flight<'a> {
+    cg: &'a CacheGrid,
+    main: TileCoord,
+    slot: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl<'a> Flight<'a> {
+    fn join(cg: &'a CacheGrid, main: TileCoord) -> Self {
+        let slot = cg.inflight.lock().entry(main).or_default().clone();
+        Flight { cg, main, slot }
+    }
+}
+
+impl Drop for Flight<'_> {
+    fn drop(&mut self) {
+        let mut m = self.cg.inflight.lock();
+        // The map's reference and ours: nobody else waits.
+        if Arc::strong_count(&self.slot) == 2 {
+            m.remove(&self.main);
+        }
+    }
 }
 
 pub struct Tile {
@@ -35,6 +62,9 @@ pub struct Tile {
 pub struct TileManager {
     pub cfg: Arc<Config>,
     caches: HashMap<(String, String), Arc<CacheGrid>>,
+    /// Bounds concurrent on-demand metatile renders (`RMAPPROXY_MAX_RENDERS`, 0 = unbounded);
+    /// each render fetches all of the cache's sources at once. Seeding has its own `-c`.
+    renders: Option<tokio::sync::Semaphore>,
 }
 
 impl TileManager {
@@ -90,11 +120,17 @@ impl TileManager {
                     meta: MetaGrid { grid, meta_size: c.meta_size, meta_buffer: c.meta_buffer },
                     sources: srcs.clone(),
                     image: c.image.clone(),
+                    inflight: Default::default(),
                 };
                 caches.insert((c.name.clone(), g.clone()), Arc::new(cg));
             }
         }
-        Ok(TileManager { cfg, caches })
+        let max_renders = match std::env::var("RMAPPROXY_MAX_RENDERS") {
+            Ok(v) => v.parse::<usize>().with_context(|| format!("RMAPPROXY_MAX_RENDERS={v}"))?,
+            Err(_) => 32,
+        };
+        let renders = (max_renders > 0).then(|| tokio::sync::Semaphore::new(max_renders));
+        Ok(TileManager { cfg, caches, renders })
     }
 
     pub fn cache_grid(&self, cache: &str, grid: &str) -> Option<Arc<CacheGrid>> {
@@ -111,6 +147,16 @@ impl TileManager {
         }
         let meta = cg.meta.meta_tile(coord);
         let main = meta.main_tile().ok_or_else(|| anyhow!("empty metatile"))?;
+        let flight = Flight::join(cg, main);
+        let _rendering = flight.slot.lock().await;
+        // Rendered by another request of this process while we waited.
+        if let Some(data) = cg.file.load(coord) {
+            return Ok(Tile { data, mtime: cg.file.mtime(coord) });
+        }
+        let _permit = match &self.renders {
+            Some(s) => Some(s.acquire().await?),
+            None => None,
+        };
         let lock_cg = cg.clone();
         let _lock = tokio::task::spawn_blocking(move || lock_cg.file.lock(main)).await??;
         // Another process may have created it while we waited for the lock.

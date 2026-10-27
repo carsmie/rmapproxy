@@ -302,7 +302,11 @@ pub async fn run_worker(mgr: Arc<TileManager>, admin: String, name: String, bind
         let app = axum::Router::new().route("/healthz", axum::routing::get(|| async { "ok\n" }));
         let _ = axum::serve(listener, app).await;
     });
-    let client = reqwest::Client::builder().timeout(Duration::from_secs(30)).build()?;
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Some(token) = crate::admin::worker_token() {
+        headers.insert(reqwest::header::AUTHORIZATION, format!("Bearer {token}").parse().context("RMAPPROXY_WORKER_TOKEN")?);
+    }
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(30)).default_headers(headers).build()?;
     let mut task_cache: HashMap<String, Arc<Vec<Arc<SeedTask>>>> = HashMap::new();
     info!("worker {name}: leasing chunks from {admin}");
     while !stop.load(Ordering::SeqCst) {
