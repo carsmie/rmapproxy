@@ -289,9 +289,7 @@ pub async fn run_worker(mgr: Arc<TileManager>, admin: String, name: String, bind
     {
         let stop = stop.clone();
         tokio::spawn(async move {
-            use tokio::signal::unix::{SignalKind, signal};
-            let (Ok(mut term), Ok(mut int)) = (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) else { return };
-            tokio::select! { _ = term.recv() => {}, _ = int.recv() => {} }
+            crate::server::shutdown_signal().await;
             info!("worker: stopping after the current chunk's in-flight metatiles");
             stop.store(true, Ordering::SeqCst);
         });
@@ -467,6 +465,7 @@ async fn render_chunk(
         }
         Err(e) => {
             errors += 1;
+            done.fetch_add(1, Ordering::Relaxed);
             if messages.len() < 5 {
                 messages.push(e.to_string());
             }

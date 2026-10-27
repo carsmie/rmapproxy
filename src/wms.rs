@@ -181,7 +181,7 @@ impl Wms {
         let p = |k: &str| q.get(k).map(String::as_str).unwrap_or("");
         let srs_code = if version == Version::V130 { p("crs") } else { p("srs") };
         let (w, h) = (p("width").parse::<u32>(), p("height").parse::<u32>());
-        let (Ok(w), Ok(h)) = (w, h) else { return Err(err("MissingDimensionValue", "invalid width/height".into())) };
+        let (Ok(w @ 1..), Ok(h @ 1..)) = (w, h) else { return Err(err("MissingDimensionValue", "invalid width/height".into())) };
         if (w as u64) * (h as u64) > self.conf.max_output_pixels {
             return Err(err("", "image size too large".into()));
         }

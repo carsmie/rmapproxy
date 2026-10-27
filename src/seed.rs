@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, anyhow, bail};
+use futures::FutureExt;
 use serde_yaml::Value;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -72,7 +73,8 @@ fn before_timestamp(v: Option<&Value>) -> Result<Option<SystemTime>> {
     }
     let secs = |k: &str, f: f64| v.get(k).and_then(|x| x.as_f64().or(x.as_i64().map(|i| i as f64))).unwrap_or(0.0) * f;
     let delta = secs("weeks", 604800.0) + secs("days", 86400.0) + secs("hours", 3600.0) + secs("minutes", 60.0) + secs("seconds", 1.0);
-    Ok(Some(SystemTime::now() - Duration::from_secs_f64(delta)))
+    let delta = Duration::try_from_secs_f64(delta).map_err(|_| anyhow!("invalid refresh_before/remove_before {v:?}"))?;
+    Ok(Some(SystemTime::now().checked_sub(delta).unwrap_or(SystemTime::UNIX_EPOCH)))
 }
 
 /// Tasks named in `names` from the `seeds:` or `cleanups:` section (one per cache × grid).
@@ -244,6 +246,10 @@ pub async fn process_meta(mgr: &Arc<TileManager>, t: &Arc<SeedTask>, main: TileC
     let meta = t.cg.meta.meta_tile(main);
     let lock_cg = t.cg.clone();
     let _l = tokio::task::spawn_blocking(move || lock_cg.file.lock(main)).await??;
+    // Another seeder (or `serve`) may have rendered it while we waited for the lock.
+    if !needs_work(t, main) {
+        return Ok(0);
+    }
     // A source error (on_error: transparent) leaves the metatile unstored: MapProxy's seeder
     // counts that as done; here it is an error, so it shows in the summary/exit code and the
     // resume point stays before it.
@@ -522,7 +528,11 @@ pub async fn run(mgr: Arc<TileManager>, tasks: Vec<SeedTask>, mode: Mode, concur
             let (m, t) = (mgr.clone(), task.clone());
             set.spawn(async move {
                 let _p = permit;
-                let r = process_meta(&m, &t, main, seeding).await;
+                // A panic is one failed metatile, not the end of the run (and its progress).
+                let r = std::panic::AssertUnwindSafe(process_meta(&m, &t, main, seeding))
+                    .catch_unwind()
+                    .await
+                    .unwrap_or_else(|p| Err(anyhow!("panic: {}", panic_message(&*p))));
                 (i, z, main, r)
             });
             while let Some(r) = set.try_join_next() {
@@ -565,6 +575,10 @@ pub async fn run(mgr: Arc<TileManager>, tasks: Vec<SeedTask>, mode: Mode, concur
         p.remove();
     }
     Ok(())
+}
+
+fn panic_message(p: &(dyn std::any::Any + Send)) -> &str {
+    p.downcast_ref::<&str>().copied().or_else(|| p.downcast_ref::<String>().map(String::as_str)).unwrap_or("?")
 }
 
 fn clock() -> String {
