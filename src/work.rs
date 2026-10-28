@@ -289,9 +289,7 @@ pub async fn run_worker(mgr: Arc<TileManager>, admin: String, name: String, bind
     {
         let stop = stop.clone();
         tokio::spawn(async move {
-            use tokio::signal::unix::{SignalKind, signal};
-            let (Ok(mut term), Ok(mut int)) = (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) else { return };
-            tokio::select! { _ = term.recv() => {}, _ = int.recv() => {} }
+            crate::server::shutdown_signal().await;
             info!("worker: stopping after the current chunk's in-flight metatiles");
             stop.store(true, Ordering::SeqCst);
         });
@@ -302,7 +300,11 @@ pub async fn run_worker(mgr: Arc<TileManager>, admin: String, name: String, bind
         let app = axum::Router::new().route("/healthz", axum::routing::get(|| async { "ok\n" }));
         let _ = axum::serve(listener, app).await;
     });
-    let client = reqwest::Client::builder().timeout(Duration::from_secs(30)).build()?;
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Some(token) = crate::admin::worker_token() {
+        headers.insert(reqwest::header::AUTHORIZATION, format!("Bearer {token}").parse().context("RMAPPROXY_WORKER_TOKEN")?);
+    }
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(30)).default_headers(headers).build()?;
     let mut task_cache: HashMap<String, Arc<Vec<Arc<SeedTask>>>> = HashMap::new();
     info!("worker {name}: leasing chunks from {admin}");
     while !stop.load(Ordering::SeqCst) {
@@ -436,12 +438,8 @@ async fn render_chunk(
                 let mut b = body.clone();
                 b["done"] = done.load(Ordering::Relaxed).into();
                 b["tiles"] = tiles.load(Ordering::Relaxed).into();
-                if let Ok(r) = post_json(&client, &url, &b).await {
-                    if let Some(v) = r.bytes().await.ok().and_then(|b| serde_json::from_slice::<Json>(&b).ok()) {
-                        if v["keep"] == false {
-                            lost.store(true, Ordering::SeqCst);
-                        }
-                    }
+                if let Ok(r) = post_json(&client, &url, &b).await && let Some(v) = r.bytes().await.ok().and_then(|b| serde_json::from_slice::<Json>(&b).ok()) && v["keep"] == false {
+                    lost.store(true, Ordering::SeqCst);
                 }
             }
         })
@@ -463,6 +461,7 @@ async fn render_chunk(
         }
         Err(e) => {
             errors += 1;
+            done.fetch_add(1, Ordering::Relaxed);
             if messages.len() < 5 {
                 messages.push(e.to_string());
             }

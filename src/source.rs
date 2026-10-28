@@ -75,10 +75,8 @@ impl WmsSource {
                 return false;
             }
         }
-        if let Some(max) = self.conf.max_res {
-            if max > xr || max > yr {
-                return false;
-            }
+        if let Some(max) = self.conf.max_res && (max > xr || max > yr) {
+            return false;
         }
         true
     }
@@ -87,10 +85,8 @@ impl WmsSource {
         if (self.conf.min_res.is_some() || self.conf.max_res.is_some()) && !self.res_in_range(bbox, size, srs) {
             return Ok(SourceImage::Skip);
         }
-        if let Some(cov) = &self.conf.coverage {
-            if !cov.intersects(bbox, srs)? {
-                return Ok(SourceImage::Skip);
-            }
+        if let Some(cov) = &self.conf.coverage && !cov.intersects(bbox, srs)? {
+            return Ok(SourceImage::Skip);
         }
         let needs_transform = !self.conf.supported_srs.is_empty() && !self.conf.supported_srs.contains(srs);
         let r = if needs_transform { self.fetch_transformed(bbox, size, srs).await } else { self.fetch(bbox, size, srs).await };
@@ -105,17 +101,15 @@ impl WmsSource {
     }
 
     async fn fetch(&self, bbox: BBox, size: (u32, u32), srs: &Srs) -> Result<SourceImage> {
-        if let Some(cov) = &self.conf.coverage {
-            if !cov.extent_contains(bbox, srs)? {
-                // `_get_sub_query`: request only the part inside the coverage extent.
-                let (sub_size, off, sub_bbox) = bbox_position_in_image(bbox, size, cov.extent_bbox_for(srs)?);
-                if sub_size.0 == 0 || sub_size.1 == 0 {
-                    return Ok(SourceImage::Skip);
-                }
-                // sub_image_result: pasted into a transparent canvas, composited when merged.
-                let data = self.request(sub_bbox, sub_size, srs).await?;
-                return Ok(SourceImage::Png { data, size: sub_size, place: Some(off) });
+        if let Some(cov) = &self.conf.coverage && !cov.extent_contains(bbox, srs)? {
+            // `_get_sub_query`: request only the part inside the coverage extent.
+            let (sub_size, off, sub_bbox) = bbox_position_in_image(bbox, size, cov.extent_bbox_for(srs)?);
+            if sub_size.0 == 0 || sub_size.1 == 0 {
+                return Ok(SourceImage::Skip);
             }
+            // sub_image_result: pasted into a transparent canvas, composited when merged.
+            let data = self.request(sub_bbox, sub_size, srs).await?;
+            return Ok(SourceImage::Png { data, size: sub_size, place: Some(off) });
         }
         let data = self.request(bbox, size, srs).await?;
         Ok(SourceImage::Png { data, size, place: None })
@@ -160,7 +154,7 @@ impl WmsSource {
                     // img_for_resampling converts P to its palette mode, RGB: tRNS is lost.
                     png::ColorType::Indexed if self.transparent() => (img, true, mode),
                     png::ColorType::Indexed => {
-                        img.px.chunks_exact_mut(4).for_each(|p| p[3] = 255);
+                        img.px.as_chunks_mut::<4>().0.iter_mut().for_each(|p| p[3] = 255);
                         (img, false, MergeMode::Paste)
                     }
                     // RGB/L; a tRNS colour key would be re-applied to warped pixels by

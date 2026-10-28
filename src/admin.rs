@@ -344,7 +344,7 @@ impl Admin {
             job.progress = read_progress(&self.progress_path(&job.id)).unwrap_or_default();
             jobs.push(job);
         }
-        jobs.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        jobs.sort_by_key(|a| a.created_at);
         info!("admin: {} unfinished job(s) in {}", jobs.len(), self.dir.display());
         *self.jobs.lock() = jobs;
     }
@@ -758,10 +758,8 @@ impl Admin {
             j.tiles += w[2].parse::<u64>().unwrap_or(0);
             j.errors += w[5].parse::<u64>().unwrap_or(0);
             j.task_tiles = 0;
-        } else if line.starts_with('[') && line.ends_with(" tiles)") {
-            if let Some(n) = line.rsplit_once('(').and_then(|(_, r)| r.split_whitespace().next()?.parse().ok()) {
-                j.task_tiles = n;
-            }
+        } else if line.starts_with('[') && line.ends_with(" tiles)") && let Some(n) = line.rsplit_once('(').and_then(|(_, r)| r.split_whitespace().next()?.parse().ok()) {
+            j.task_tiles = n;
         }
         j.last_activity = SystemTime::now();
         if j.log.len() >= LOG_MAX {
@@ -910,10 +908,8 @@ impl Admin {
         if j.queue.is_some() {
             return self.distributed_json(j, with_log);
         }
-        if matches!(j.state, "running" | "stopping") {
-            if let Some(p) = read_progress(&self.progress_path(&j.id)) {
-                j.progress = p;
-            }
+        if matches!(j.state, "running" | "stopping") && let Some(p) = read_progress(&self.progress_path(&j.id)) {
+            j.progress = p;
         }
         let running = matches!(j.state, "running" | "stopping");
         let duration = match j.finished_at {
@@ -1137,10 +1133,8 @@ impl Admin {
 
     fn release(&self, b: &Json) {
         let (job, chunk) = (b["job"].as_str().unwrap_or_default(), b["chunk"].as_u64().unwrap_or(u64::MAX) as usize);
-        if let Some(q) = self.jobs.lock().iter_mut().find(|j| j.id == job).and_then(|j| j.queue.as_mut()) {
-            if chunk < q.len() {
-                q.release(chunk);
-            }
+        if let Some(q) = self.jobs.lock().iter_mut().find(|j| j.id == job).and_then(|j| j.queue.as_mut()) && chunk < q.len() {
+            q.release(chunk);
         }
         self.seen(b["worker"].as_str().unwrap_or("?"), None, None);
     }
@@ -1717,9 +1711,48 @@ pub fn router(admin: Arc<Admin>) -> Router {
         .route("/_admin/stats/refresh", post(stats_refresh))
         .route("/_admin/legends", post(legends))
         .route("/_admin/{file}", get(asset))
+        .layer(axum::middleware::from_fn(guard))
         .with_state(admin)
 }
 
+/// Request headers that mark a browser request from another site: the admin API is reachable
+/// from operators' browsers, so a page elsewhere must not be able to start or stop jobs.
+fn cross_site(h: &header::HeaderMap) -> bool {
+    let get = |n: &str| h.get(n).and_then(|v| v.to_str().ok());
+    if let Some(site) = get("sec-fetch-site") {
+        return !matches!(site, "same-origin" | "none");
+    }
+    // Browsers without Fetch Metadata: the Origin of a POST has to be this host.
+    match get("origin") {
+        Some(origin) => {
+            let host = get("x-forwarded-host").or_else(|| get("host")).unwrap_or_default();
+            origin.split_once("://").map(|(_, h)| h) != Some(host)
+        }
+        None => false,
+    }
+}
+
+/// `RMAPPROXY_WORKER_TOKEN`, if set: the bearer token seed workers send on `/_admin/work/*`.
+pub fn worker_token() -> Option<String> {
+    std::env::var("RMAPPROXY_WORKER_TOKEN").ok().filter(|t| !t.is_empty())
+}
+
+async fn guard(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    if req.method() != axum::http::Method::GET && cross_site(req.headers()) {
+        return msg(StatusCode::FORBIDDEN, "Forespørsler fra andre nettsteder er ikke tillatt.");
+    }
+    if req.uri().path().starts_with("/_admin/work/")
+        && let Some(token) = worker_token()
+    {
+        let sent = req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
+        if sent != Some(token.as_str()) {
+            return msg(StatusCode::UNAUTHORIZED, "Ugyldig eller manglende arbeider-token.");
+        }
+    }
+    next.run(req).await
+}
+
+#[allow(clippy::result_large_err)] // the error is the ready response
 fn parse_body(body: &Bytes) -> Result<Json, Response> {
     serde_json::from_slice(body).map_err(|e| msg(StatusCode::BAD_REQUEST, format!("Ugyldig JSON: {e}")))
 }
@@ -1879,6 +1912,24 @@ mod tests {
         assert!(valid_id("20261027-101530-seed"));
         assert!(!valid_id("../x") && !valid_id(".hidden") && !valid_id("a/b"));
         assert_eq!(url_escape("a b,c&d"), "a%20b,c%26d");
+    }
+
+    #[test]
+    fn cross_site_requests() {
+        let h = |pairs: &[(&'static str, &'static str)]| {
+            let mut m = header::HeaderMap::new();
+            for (k, v) in pairs {
+                m.insert(*k, v.parse().unwrap());
+            }
+            m
+        };
+        // Workers and curl send neither header.
+        assert!(!cross_site(&h(&[("host", "admin:8080")])));
+        assert!(!cross_site(&h(&[("sec-fetch-site", "same-origin"), ("origin", "https://x")])));
+        assert!(cross_site(&h(&[("sec-fetch-site", "cross-site")])));
+        assert!(cross_site(&h(&[("sec-fetch-site", "same-site")])));
+        assert!(!cross_site(&h(&[("origin", "https://topo.example"), ("host", "pod"), ("x-forwarded-host", "topo.example")])));
+        assert!(cross_site(&h(&[("origin", "https://evil.example"), ("host", "topo.example")])));
     }
 
     #[test]

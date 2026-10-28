@@ -27,6 +27,17 @@ struct App {
 }
 
 pub async fn serve(mgr: Arc<TileManager>, bind: &str, admin: Option<crate::admin::AdminOpts>) -> anyhow::Result<()> {
+    let router = app(mgr, admin)?;
+    let listener = tokio::net::TcpListener::bind(bind).await?;
+    info!("listening on {bind}");
+    axum::serve(listener, router).with_graceful_shutdown(shutdown_signal()).await?;
+    info!("stopped");
+    Ok(())
+}
+
+/// All routes of `serve`; with `admin`, the admin API too (which starts its background tasks,
+/// so this needs a runtime).
+pub fn app(mgr: Arc<TileManager>, admin: Option<crate::admin::AdminOpts>) -> anyhow::Result<Router> {
     let mut layers = HashMap::new();
     for l in &mgr.cfg.layers {
         match l.sources.as_slice() {
@@ -48,17 +59,25 @@ pub async fn serve(mgr: Arc<TileManager>, bind: &str, admin: Option<crate::admin
         .route("/legend/{file}", get(legend))
         .route("/healthz", get(|| async { "ok\n" }))
         .fallback(|| async { ows_error(StatusCode::NOT_FOUND, "NotFound", "unknown path") })
-        .with_state(app);
+        .with_state(app)
+        // The open CORS headers are for the map services only, never for /_admin.
+        .layer(axum::middleware::from_fn(cors));
     // `serve --admin` only: the serving replicas never expose /_admin.
     if let Some(a) = admin {
         info!("admin API on /_admin");
         router = router.merge(crate::admin::router(a));
     }
-    let router = router.layer(axum::middleware::from_fn(cors)).layer(axum::middleware::from_fn(access_log));
-    let listener = tokio::net::TcpListener::bind(bind).await?;
-    info!("listening on {bind}");
-    axum::serve(listener, router).await?;
-    Ok(())
+    Ok(router.layer(axum::middleware::from_fn(access_log)))
+}
+
+/// SIGTERM (pod shutdown) or SIGINT: in-flight requests finish, new connections are refused.
+pub async fn shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let (Ok(mut term), Ok(mut int)) = (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) else {
+        return std::future::pending().await;
+    };
+    tokio::select! { _ = term.recv() => {}, _ = int.recv() => {} }
+    info!("shutting down");
 }
 
 /// tnt-mapproxy's `/legend/topo-<scale>.png`: files the admin app writes to
@@ -172,6 +191,7 @@ async fn rest_caps(State(app): State<App>, headers: HeaderMap) -> Response {
     caps(&app, &headers, true)
 }
 
+#[allow(clippy::result_large_err)] // the error is the ready response
 fn resolve(app: &App, layer: &str, set: &str) -> Result<Arc<CacheGrid>, Response> {
     let (_, cache) = app
         .layers
@@ -211,10 +231,8 @@ async fn tile(app: &App, layer: &str, set: &str, z: &str, row: &str, col: &str) 
                     h.insert(header::CACHE_CONTROL, v);
                 }
             }
-            if let Some(m) = t.mtime {
-                if let Ok(v) = HeaderValue::from_str(&httpdate::fmt_http_date(m)) {
-                    h.insert(header::LAST_MODIFIED, v);
-                }
+            if let Some(m) = t.mtime && let Ok(v) = HeaderValue::from_str(&httpdate::fmt_http_date(m)) {
+                h.insert(header::LAST_MODIFIED, v);
             }
             r
         }
@@ -236,13 +254,7 @@ fn request_base(headers: &HeaderMap) -> String {
 /// Public base URL: MAPPROXY_PUBLIC_URL / services online_resource, else from the request.
 fn base_url(app: &App, headers: &HeaderMap) -> String {
     let or = app.mgr.cfg.wmts.online_resource.trim_end_matches("/service").trim_end_matches('/');
-    if !or.is_empty() {
-        return or.to_string();
-    }
-    let h = |n: &str| headers.get(n).and_then(|v| v.to_str().ok()).map(String::from);
-    let proto = h("x-forwarded-proto").unwrap_or_else(|| "http".into());
-    let host = h("x-forwarded-host").or_else(|| h("host")).unwrap_or_else(|| "localhost".into());
-    format!("{proto}://{host}")
+    if or.is_empty() { request_base(headers) } else { or.to_string() }
 }
 
 fn caps(app: &App, headers: &HeaderMap, restful: bool) -> Response {

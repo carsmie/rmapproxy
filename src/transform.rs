@@ -92,8 +92,8 @@ pub fn transform_meshes(
     fn add(
         q: [i64; 4],
         out: &mut Vec<Mesh>,
-        to_src: &dyn Fn([i64; 4]) -> Result<[f64; 8]>,
-        is_good: &dyn Fn([i64; 4], &[f64; 8]) -> Result<bool>,
+        to_src: &QuadToSrc,
+        is_good: &QuadIsGood,
     ) -> Result<()> {
         let s = to_src(q)?;
         if is_good(q, &s)? {
@@ -116,8 +116,13 @@ fn muldiv255(a: u32, b: u32) -> u8 {
     (((t >> 8) + t) >> 8) as u8
 }
 
+/// A destination quad's corners in source pixels (`add_meshes`).
+type QuadToSrc<'a> = dyn Fn([i64; 4]) -> Result<[f64; 8]> + 'a;
+/// Whether a quad and its source corners are fine enough to warp as one mesh.
+type QuadIsGood<'a> = dyn Fn([i64; 4], &[f64; 8]) -> Result<bool> + 'a;
+
 fn premultiply(img: &mut Rgba) {
-    for p in img.px.chunks_exact_mut(4) {
+    for p in img.px.as_chunks_mut::<4>().0 {
         let a = p[3] as u32;
         for c in &mut p[..3] {
             *c = muldiv255(*c as u32, a);
@@ -126,7 +131,7 @@ fn premultiply(img: &mut Rgba) {
 }
 
 fn unpremultiply(img: &mut Rgba) {
-    for p in img.px.chunks_exact_mut(4) {
+    for p in img.px.as_chunks_mut::<4>().0 {
         let a = p[3] as u32;
         if a != 0 && a != 255 {
             for c in &mut p[..3] {

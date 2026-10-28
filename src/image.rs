@@ -31,7 +31,7 @@ impl Rgba {
     /// Pillow `Image.alpha_composite(self, src)` in place.
     pub fn alpha_composite(&mut self, src: &Rgba) {
         debug_assert_eq!((self.w, self.h), (src.w, src.h));
-        for (d, s) in self.px.chunks_exact_mut(4).zip(src.px.chunks_exact(4)) {
+        for (d, s) in self.px.as_chunks_mut::<4>().0.iter_mut().zip(src.px.as_chunks::<4>().0) {
             composite_px(d, s);
         }
     }
@@ -65,7 +65,7 @@ impl Rgba {
     /// `is_single_color_image`: the colour if every pixel is identical.
     pub fn single_color(&self) -> Option<[u8; 4]> {
         let first: [u8; 4] = self.px.get(0..4)?.try_into().ok()?;
-        self.px.chunks_exact(4).all(|p| p == first).then_some(first)
+        self.px.as_chunks::<4>().0.iter().all(|p| *p == first).then_some(first)
     }
 }
 
@@ -145,7 +145,7 @@ pub fn decode_png_typed(data: &[u8]) -> Result<(Rgba, MergeMode, png::ColorType)
     match frame.color_type {
         png::ColorType::Rgba => px = buf,
         png::ColorType::Rgb => {
-            for p in buf.chunks_exact(3) {
+            for p in buf.as_chunks::<3>().0 {
                 px.extend_from_slice(&[p[0], p[1], p[2], 255]);
             }
         }
@@ -155,7 +155,7 @@ pub fn decode_png_typed(data: &[u8]) -> Result<(Rgba, MergeMode, png::ColorType)
             }
         }
         png::ColorType::GrayscaleAlpha => {
-            for p in buf.chunks_exact(2) {
+            for p in buf.as_chunks::<2>().0 {
                 px.extend_from_slice(&[p[0], p[0], p[0], p[1]]);
             }
         }
@@ -236,9 +236,9 @@ pub fn encode_png_paletted(w: u32, h: u32, palette: &[[u8; 3]], idx: &[u8], tran
 /// MapProxy `quantize(img, colors, alpha=True, quantizer='mediancut')`: median cut of the
 /// RGB channels to colors-1 entries, then index 255 where alpha <= 128.
 pub fn quantize_mediancut_alpha(img: &Rgba, colors: u32) -> (Vec<[u8; 3]>, Vec<u8>) {
-    let rgb: Vec<[u8; 3]> = img.px.chunks_exact(4).map(|p| [p[0], p[1], p[2]]).collect();
+    let rgb: Vec<[u8; 3]> = img.px.as_chunks::<4>().0.iter().map(|p| [p[0], p[1], p[2]]).collect();
     let (pal, mut idx) = crate::quantize::mediancut(&rgb, colors - 1);
-    for (i, p) in img.px.chunks_exact(4).enumerate() {
+    for (i, p) in img.px.as_chunks::<4>().0.iter().enumerate() {
         if p[3] <= 128 {
             idx[i] = 255;
         }

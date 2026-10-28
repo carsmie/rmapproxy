@@ -25,7 +25,37 @@ pub struct CacheGrid {
     pub meta: MetaGrid,
     pub sources: Vec<Arc<WmsSource>>,
     pub image: ImageOpts,
+    /// Metatiles being rendered on demand in this process: requests for tiles of the same
+    /// metatile wait here instead of each polling the flock in a blocking thread.
+    inflight: parking_lot::Mutex<HashMap<TileCoord, Arc<tokio::sync::Mutex<()>>>>,
 }
+
+/// A request's claim on an `inflight` slot; the slot is removed by the last one out.
+struct Flight<'a> {
+    cg: &'a CacheGrid,
+    main: TileCoord,
+    slot: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl<'a> Flight<'a> {
+    fn join(cg: &'a CacheGrid, main: TileCoord) -> Self {
+        let slot = cg.inflight.lock().entry(main).or_default().clone();
+        Flight { cg, main, slot }
+    }
+}
+
+impl Drop for Flight<'_> {
+    fn drop(&mut self) {
+        let mut m = self.cg.inflight.lock();
+        // The map's reference and ours: nobody else waits.
+        if Arc::strong_count(&self.slot) == 2 {
+            m.remove(&self.main);
+        }
+    }
+}
+
+/// A tile of a rendered metatile: coordinate, encoded image, single colour (if any).
+type EncodedTile = (TileCoord, Vec<u8>, Option<[u8; 4]>);
 
 pub struct Tile {
     pub data: Vec<u8>,
@@ -35,10 +65,22 @@ pub struct Tile {
 pub struct TileManager {
     pub cfg: Arc<Config>,
     caches: HashMap<(String, String), Arc<CacheGrid>>,
+    /// Bounds concurrent on-demand metatile renders (`RMAPPROXY_MAX_RENDERS`, 0 = unbounded);
+    /// each render fetches all of the cache's sources at once. Seeding has its own `-c`.
+    renders: Option<tokio::sync::Semaphore>,
 }
 
 impl TileManager {
     pub fn new(cfg: Arc<Config>) -> Result<TileManager> {
+        let max_renders = match std::env::var("RMAPPROXY_MAX_RENDERS") {
+            Ok(v) => v.parse::<usize>().with_context(|| format!("RMAPPROXY_MAX_RENDERS={v}"))?,
+            Err(_) => 32,
+        };
+        Self::with_max_renders(cfg, max_renders)
+    }
+
+    /// `new` with an explicit on-demand render limit (0 = unbounded).
+    pub fn with_max_renders(cfg: Arc<Config>, max_renders: usize) -> Result<TileManager> {
         let client = reqwest::Client::builder()
             .pool_max_idle_per_host(64)
             .user_agent(concat!("rmapproxy/", env!("CARGO_PKG_VERSION")))
@@ -90,11 +132,13 @@ impl TileManager {
                     meta: MetaGrid { grid, meta_size: c.meta_size, meta_buffer: c.meta_buffer },
                     sources: srcs.clone(),
                     image: c.image.clone(),
+                    inflight: Default::default(),
                 };
                 caches.insert((c.name.clone(), g.clone()), Arc::new(cg));
             }
         }
-        Ok(TileManager { cfg, caches })
+        let renders = (max_renders > 0).then(|| tokio::sync::Semaphore::new(max_renders));
+        Ok(TileManager { cfg, caches, renders })
     }
 
     pub fn cache_grid(&self, cache: &str, grid: &str) -> Option<Arc<CacheGrid>> {
@@ -111,6 +155,16 @@ impl TileManager {
         }
         let meta = cg.meta.meta_tile(coord);
         let main = meta.main_tile().ok_or_else(|| anyhow!("empty metatile"))?;
+        let flight = Flight::join(cg, main);
+        let _rendering = flight.slot.lock().await;
+        // Rendered by another request of this process while we waited.
+        if let Some(data) = cg.file.load(coord) {
+            return Ok(Tile { data, mtime: cg.file.mtime(coord) });
+        }
+        let _permit = match &self.renders {
+            Some(s) => Some(s.acquire().await?),
+            None => None,
+        };
         let lock_cg = cg.clone();
         let _lock = tokio::task::spawn_blocking(move || lock_cg.file.lock(main)).await??;
         // Another process may have created it while we waited for the lock.
@@ -163,7 +217,7 @@ impl TileManager {
         let tile_size = cg.meta.grid.tile_size;
         let tiles: Vec<(TileCoord, (u32, u32))> = meta.tiles.iter().filter_map(|(c, off)| c.map(|c| (c, *off))).collect();
         let image = cg.image.clone();
-        let encoded = tokio::task::spawn_blocking(move || -> Result<Vec<(TileCoord, Vec<u8>, Option<[u8; 4]>)>> {
+        let encoded = tokio::task::spawn_blocking(move || -> Result<Vec<EncodedTile>> {
             let merged = merger.finish();
             let parts: Vec<_> = tiles
                 .iter()

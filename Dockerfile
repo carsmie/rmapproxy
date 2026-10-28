@@ -4,9 +4,10 @@ FROM rust:1.98-alpine AS build
 RUN apk add --no-cache musl-dev
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
+# Dependencies in their own layer, so source changes don't rebuild them.
+RUN mkdir src && echo 'fn main() {}' > src/main.rs && cargo build --release --locked && rm -rf src
 COPY src src
-COPY tests tests
-RUN cargo build --release --locked && strip target/release/rmapproxy
+RUN touch src/main.rs && cargo build --release --locked && strip target/release/rmapproxy
 
 FROM alpine:3.22
 RUN apk upgrade --no-cache && adduser -D -u 150 mapproxy
