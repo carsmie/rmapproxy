@@ -1477,9 +1477,8 @@ fn estimate_task(t: &seed::SeedTask) -> Result<(u64, u64)> {
         Some(c) => c.extent_bbox_for(&g.srs)?,
         None => g.bbox,
     };
-    let (mut metas, mut tiles) = (0u64, 0u64);
-    let mut ratio: Option<f64> = None;
-    for &z in &t.levels {
+    // Tile and metatile ranges of `bbox` at level z (None when it misses the grid).
+    let range = |z: usize| {
         let delta = g.res[z] / 10.0;
         let (x0, y0, _) = g.tile_coord_for_point(bbox[0] + delta, bbox[1] + delta, z);
         let (x1, y1, _) = g.tile_coord_for_point(bbox[2] - delta, bbox[3] - delta, z);
@@ -1487,22 +1486,38 @@ fn estimate_task(t: &seed::SeedTask) -> Result<(u64, u64)> {
         let (xa, xb) = (x0.min(x1).max(0), x0.max(x1).min(gs.0 - 1));
         let (ya, yb) = (y0.min(y1).max(0), y0.max(y1).min(gs.1 - 1));
         if xa > xb || ya > yb {
-            continue;
+            return None;
         }
         let ms = mg.meta_size(z);
         let (mx0, mx1, my0, my1) = (xa.div_euclid(ms.0), xb.div_euclid(ms.0), ya.div_euclid(ms.1), yb.div_euclid(ms.1));
-        let level_metas = ((mx1 - mx0 + 1) * (my1 - my0 + 1)) as u64;
-        let level_tiles = ((xb - xa + 1) * (yb - ya + 1)) as u64;
+        Some((((mx1 - mx0 + 1) * (my1 - my0 + 1)) as u64, ((xb - xa + 1) * (yb - ya + 1)) as u64, (mx0, mx1, my0, my1), ms))
+    };
+    let hits = |c: &crate::coverage::Coverage, z: usize, (mx0, mx1, my0, my1): (i64, i64, i64, i64), ms: (i64, i64)| -> Result<u64> {
+        let mut hit = 0u64;
+        for my in my0..=my1 {
+            for mx in mx0..=mx1 {
+                if c.intersects(mg.meta_tile((mx * ms.0, my * ms.1, z)).bbox, &g.srs)? {
+                    hit += 1;
+                }
+            }
+        }
+        Ok(hit)
+    };
+    let (mut metas, mut tiles) = (0u64, 0u64);
+    let mut ratio: Option<f64> = None;
+    // A deep level alone (e.g. only z14) is too big to test: take the hit ratio from the deepest
+    // shallower level that is testable, not the whole bbox (~3.4x too high for Norway).
+    if let (Some(c), Some(&z0)) = (&t.coverage, t.levels.iter().min())
+        && range(z0).is_some_and(|(m, ..)| m > 20_000)
+        && let Some((z, (m, _, r, ms))) = (0..z0).rev().find_map(|z| range(z).filter(|(m, ..)| *m <= 20_000).map(|v| (z, v)))
+    {
+        ratio = Some(hits(c, z, r, ms)? as f64 / m.max(1) as f64);
+    }
+    for &z in &t.levels {
+        let Some((level_metas, level_tiles, (mx0, mx1, my0, my1), ms)) = range(z) else { continue };
         match &t.coverage {
             Some(c) if level_metas <= 20_000 => {
-                let mut hit = 0u64;
-                for my in my0..=my1 {
-                    for mx in mx0..=mx1 {
-                        if c.intersects(mg.meta_tile((mx * ms.0, my * ms.1, z)).bbox, &g.srs)? {
-                            hit += 1;
-                        }
-                    }
-                }
+                let hit = hits(c, z, (mx0, mx1, my0, my1), ms)?;
                 metas += hit;
                 tiles += level_tiles * hit / level_metas.max(1);
                 ratio = Some(hit as f64 / level_metas.max(1) as f64);
