@@ -1,6 +1,6 @@
 # Static musl build: the binary also runs inside tnt-mapproxy's Alpine image
 # (COPY --from=<this image> /usr/local/bin/rmapproxy …).
-FROM rust:1.98-alpine AS build
+FROM rust:1.99-alpine AS build
 RUN apk add --no-cache musl-dev
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
