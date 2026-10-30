@@ -29,7 +29,10 @@ const DELAY: Duration = Duration::from_millis(200);
 
 async fn getmap(State(f): State<Arc<FakeWms>>, Query(q): Query<HashMap<String, String>>) -> axum::response::Response {
     f.total.fetch_add(1, Ordering::SeqCst);
-    if f.fail_next.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() {
+    // fetch_update is deprecated (→ try_update) on stable 1.99, but try_update is newer than the MSRV.
+    #[allow(deprecated)]
+    let fail = f.fail_next.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok();
+    if fail {
         return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "upstream connect error").into_response();
     }
     let n = f.inflight.fetch_add(1, Ordering::SeqCst) + 1;
