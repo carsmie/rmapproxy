@@ -21,12 +21,17 @@ struct FakeWms {
     total: AtomicUsize,
     inflight: AtomicUsize,
     max_inflight: AtomicUsize,
+    /// Answer this many next GetMaps with 503, like a mesh sidecar for a dead pod.
+    fail_next: AtomicUsize,
 }
 
 const DELAY: Duration = Duration::from_millis(200);
 
 async fn getmap(State(f): State<Arc<FakeWms>>, Query(q): Query<HashMap<String, String>>) -> axum::response::Response {
     f.total.fetch_add(1, Ordering::SeqCst);
+    if f.fail_next.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() {
+        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "upstream connect error").into_response();
+    }
     let n = f.inflight.fetch_add(1, Ordering::SeqCst) + 1;
     f.max_inflight.fetch_max(n, Ordering::SeqCst);
     tokio::time::sleep(DELAY).await;
@@ -149,6 +154,23 @@ async fn render_limit_bounds_concurrent_metatiles() {
         assert_eq!(env.requests(), 8);
         assert_eq!(env.wms.max_inflight.load(Ordering::SeqCst), max_inflight, "limit {limit}");
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transient_503s_are_retried_until_backoff_runs_out() {
+    let env = Env::new("retry").await;
+    let base = spawn(crate::server::app(env.mgr(0), None).unwrap()).await;
+    // Two failures: retried, the metatile is rendered and stored.
+    env.wms.fail_next.store(2, Ordering::SeqCst);
+    assert_eq!(get_all(vec![tile_url(&base, 0, 0)]).await, vec![200]);
+    assert_eq!((env.requests(), env.cached_tiles()), (4, 16));
+    // A source failing on every attempt (1 + 2 retries) fails the metatile, nothing stored.
+    env.wms.fail_next.store(usize::MAX, Ordering::SeqCst);
+    let status = get_all(vec![tile_url(&base, 0, 4)]).await[0];
+    assert_ne!(status, 200);
+    let failed = env.requests() - 4;
+    assert!((3..=6).contains(&failed), "{failed} requests");
+    assert_eq!(env.cached_tiles(), 16);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

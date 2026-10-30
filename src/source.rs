@@ -197,16 +197,43 @@ impl WmsSource {
         format!("{}{}{}", self.conf.url, sep, qs.join("&"))
     }
 
+    /// GetMap with retries on transient upstream failures (`RETRY_BACKOFF`): a backend pod
+    /// dying (OOMKill, rollout) fails every request in flight on it with 503/reset for a few
+    /// seconds; Istio's own retries are immediate and hit the same dead endpoint.
     async fn request(&self, bbox: BBox, size: (u32, u32), srs: &Srs) -> Result<Vec<u8>> {
         let url = self.getmap_url(bbox, size, srs);
         debug!("source {}: {url}", self.conf.name);
+        let mut backoff = RETRY_BACKOFF.iter();
+        loop {
+            match self.request_once(&url).await {
+                Err(Attempt::Transient(e)) => match backoff.next() {
+                    Some(d) => {
+                        warn!("source {}: {e:#}; retrying in {d:?}", self.conf.name);
+                        tokio::time::sleep(*d).await;
+                    }
+                    None => return Err(e),
+                },
+                Err(Attempt::Fatal(e)) => return Err(e),
+                Ok(body) => return Ok(body),
+            }
+        }
+    }
+
+    async fn request_once(&self, url: &str) -> std::result::Result<Vec<u8>, Attempt> {
+        let name = &self.conf.name;
+        // Connect/reset errors are transient, timeouts are not (the render already took
+        // client_timeout; repeating it only adds load).
+        let classify = |e: reqwest::Error| {
+            let msg = anyhow!("{name}: {e}");
+            if e.is_timeout() { Attempt::Fatal(msg) } else { Attempt::Transient(msg) }
+        };
         let resp = self
             .client
-            .get(&url)
+            .get(url)
             .timeout(Duration::from_secs_f64(self.conf.client_timeout))
             .send()
             .await
-            .map_err(|e| anyhow!("{}: {e}", self.conf.name))?;
+            .map_err(classify)?;
         let status = resp.status();
         let ctype = resp
             .headers()
@@ -214,15 +241,29 @@ impl WmsSource {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
-        let body = resp.bytes().await?;
+        let body = resp.bytes().await.map_err(classify)?;
+        let snippet = || String::from_utf8_lossy(&body[..body.len().min(200)]).into_owned();
         if !status.is_success() {
-            bail!("HTTP {status} from {url}: {}", String::from_utf8_lossy(&body[..body.len().min(200)]));
+            let e = anyhow!("HTTP {status} from {url}: {}", snippet());
+            return Err(if matches!(status.as_u16(), 502..=504) { Attempt::Transient(e) } else { Attempt::Fatal(e) });
         }
         if !ctype.starts_with("image/") {
-            bail!("no image from {url} ({ctype}): {}", String::from_utf8_lossy(&body[..body.len().min(200)]));
+            return Err(Attempt::Fatal(anyhow!("no image from {url} ({ctype}): {}", snippet())));
         }
         Ok(body.to_vec())
     }
+}
+
+/// Waits before each retry of a transient GetMap failure (502/503/504, connect/reset):
+/// long enough for the mesh to drop a dead endpoint, short against client_timeout.
+#[cfg(not(test))]
+const RETRY_BACKOFF: [Duration; 2] = [Duration::from_secs(2), Duration::from_secs(6)];
+#[cfg(test)]
+const RETRY_BACKOFF: [Duration; 2] = [Duration::from_millis(20), Duration::from_millis(60)];
+
+enum Attempt {
+    Transient(anyhow::Error),
+    Fatal(anyhow::Error),
 }
 
 /// `SupportedSRS.best_srs` without `preferred_src_proj`: the target itself, else the first
