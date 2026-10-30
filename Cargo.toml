@@ -17,7 +17,7 @@ libc = "0.2"
 md-5 = "0.10"
 parking_lot = "0.12.5"
 png = "0.18.1"
-proj4rs = "0.2.1"
+proj4rs = "0.3.0"
 rand = "0.9"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 serde_json = "1.0.154"
