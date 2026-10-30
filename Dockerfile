@@ -9,7 +9,7 @@ RUN mkdir src && echo 'fn main() {}' > src/main.rs && cargo build --release --lo
 COPY src src
 RUN touch src/main.rs && cargo build --release --locked && strip target/release/rmapproxy
 
-FROM alpine:3.22
+FROM alpine:3.24
 RUN apk upgrade --no-cache && adduser -D -u 150 mapproxy
 COPY --from=build /src/target/release/rmapproxy /usr/local/bin/rmapproxy
 # Installed under mapproxy-seed's name too: tnt-mapproxy's admin app and seed jobs run that
