@@ -24,7 +24,10 @@ pub struct FileCache {
 
 impl FileCache {
     pub fn new(dir: PathBuf, lock_dir: PathBuf, lock_timeout: f64, link_single_color: bool) -> FileCache {
-        let lock_id = format!("{:x}", Md5::digest(dir.to_string_lossy().as_bytes()));
+        let lock_id: String = Md5::digest(dir.to_string_lossy().as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
         FileCache { dir, lock_dir, lock_id, lock_timeout: Duration::from_secs_f64(lock_timeout), link_single_color }
     }
 
