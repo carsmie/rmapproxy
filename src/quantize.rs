@@ -1,8 +1,7 @@
-//! Pillow's median-cut quantizer (libImaging/Quant.c `quantize`, QuantHash.c, QuantHeap.c,
-//! Pillow 12.3.0), ported line by line: the hash table's bucket/chain order decides the
-//! order of equal colours in the sorted lists and therefore where boxes split, so it is
-//! reproduced exactly (including `_findPrime`'s `!start % t` quirk). Plus MapProxy's use of
-//! it (`image/__init__.py::quantize`, quantizer=mediancut, alpha=True).
+//! Pillow 12.3.0's median-cut quantizer (libImaging/Quant.c `quantize`, QuantHash.c, QuantHeap.c),
+//! ported line by line: hash bucket/chain order sets the order of equal colours, hence where boxes
+//! split, so it is exact (including `_findPrime`'s `!start % t` quirk). Plus MapProxy's use of it
+//! (`image/__init__.py::quantize`, quantizer=mediancut, alpha=True).
 
 use std::collections::HashMap;
 

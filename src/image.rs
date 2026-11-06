@@ -1,6 +1,5 @@
-//! RGBA images and the Pillow operations MapProxy uses on them: decoding, `alpha_composite`
-//! (libImaging/AlphaComposite.c, integer-exact), paste, crop, single-colour test, PNG
-//! encoding.
+//! RGBA images and MapProxy's Pillow operations: decoding, `alpha_composite`
+//! (libImaging/AlphaComposite.c, integer-exact), paste, crop, single-colour test, PNG encoding.
 
 use anyhow::{Result, anyhow, bail};
 
@@ -128,9 +127,8 @@ pub fn decode_png_typed(data: &[u8]) -> Result<(Rgba, MergeMode, png::ColorType)
     let mut reader = dec.read_info().map_err(|e| anyhow!("png: {e}"))?;
     let info = reader.info();
     let (w, h) = (info.width, info.height);
-    // Pillow mode before expansion: RGBA and P (with or without tRNS) are composited,
-    // RGB/L with a tRNS colour key are converted to RGBA first ('transparency' in info),
-    // plain RGB/L/LA are pasted.
+    // Pillow mode before expansion: RGBA and P (with or without tRNS) composite, RGB/L with a tRNS
+    // colour key convert to RGBA first ('transparency' in info), plain RGB/L/LA paste.
     let ctype = info.color_type;
     let mode = match info.color_type {
         png::ColorType::Rgba | png::ColorType::Indexed => MergeMode::Composite,

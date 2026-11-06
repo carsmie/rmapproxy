@@ -197,9 +197,9 @@ impl WmsSource {
         format!("{}{}{}", self.conf.url, sep, qs.join("&"))
     }
 
-    /// GetMap with retries on transient upstream failures (`RETRY_BACKOFF`): a backend pod
-    /// dying (OOMKill, rollout) fails every request in flight on it with 503/reset for a few
-    /// seconds; Istio's own retries are immediate and hit the same dead endpoint.
+    /// GetMap with retries on transient upstream failures (`RETRY_BACKOFF`): a dying backend pod
+    /// (OOMKill, rollout) fails its in-flight requests with 503/reset for seconds; Istio's
+    /// immediate retries hit the same dead endpoint.
     async fn request(&self, bbox: BBox, size: (u32, u32), srs: &Srs) -> Result<Vec<u8>> {
         let url = self.getmap_url(bbox, size, srs);
         debug!("source {}: {url}", self.conf.name);

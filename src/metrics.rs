@@ -1,12 +1,11 @@
-//! Prometheus metrics, for `serve` and `seed-worker`. Served on their own port
-//! (RMAPPROXY_METRICS_ADDR), never the service port, which is behind a public ingress. Label
-//! values come from the config or the router, never from client input: a raw path or layer
-//! parameter would let anyone mint unlimited series.
+//! Prometheus metrics for `serve` and `seed-worker` on their own port (RMAPPROXY_METRICS_ADDR),
+//! off the public ingress. Labels come from the config or router: client input as a label (raw
+//! path, layer parameter) would mint unlimited series.
 
-use std::sync::{LazyLock, OnceLock};
+use std::sync::LazyLock;
 use std::time::Duration;
 
-use prometheus::{Histogram, HistogramVec, IntCounter, IntCounterVec, IntGauge, histogram_opts, register_histogram, register_histogram_vec, register_int_counter_vec, register_int_gauge};
+use prometheus::{Histogram, HistogramVec, IntCounterVec, IntGauge, histogram_opts, register_histogram, register_histogram_vec, register_int_counter_vec, register_int_gauge};
 
 const RENDER_BUCKETS: &[f64] = &[0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0];
 
@@ -64,45 +63,14 @@ static SOURCE_BYTES: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!("rmapproxy_source_bytes_total", "Image bytes received from sources", &["source"]).expect("static metric")
 });
 
-pub fn http_request(route: &str, status: &str, took: Duration) {
-    HTTP_REQUESTS.with_label_values(&[route, status]).inc();
+pub fn http_request(route: &str, status: u16, took: Duration) {
+    HTTP_REQUESTS.with_label_values(&[route, status.to_string().as_str()]).inc();
     HTTP_SECONDS.with_label_values(&[route]).observe(took.as_secs_f64());
 }
 
-/// Tile lookups of one cache and grid. Resolved per zoom on first use: this is the hit path, and
-/// creating them up front would publish a zero series for every zoom of every cache.
-pub struct TileCounters {
-    cache: String,
-    grid: String,
-    zooms: Vec<[OnceLock<IntCounter>; 3]>,
-}
-
-#[derive(Clone, Copy)]
-pub enum TileResult {
-    Hit,
-    Coalesced,
-    Miss,
-}
-
-impl TileCounters {
-    pub fn new(cache: &str, grid: &str, levels: usize) -> Self {
-        let zooms = (0..levels).map(|_| Default::default()).collect();
-        TileCounters { cache: cache.into(), grid: grid.into(), zooms }
-    }
-
-    pub fn inc(&self, zoom: usize, result: TileResult) {
-        let Some(slots) = self.zooms.get(zoom) else { return };
-        slots[result as usize]
-            .get_or_init(|| {
-                let label = match result {
-                    TileResult::Hit => "hit",
-                    TileResult::Coalesced => "coalesced",
-                    TileResult::Miss => "miss",
-                };
-                TILES.with_label_values(&[self.cache.as_str(), self.grid.as_str(), zoom.to_string().as_str(), label])
-            })
-            .inc();
-    }
+/// `result`: hit, coalesced or miss.
+pub fn tile_request(cache: &str, grid: &str, zoom: usize, result: &str) {
+    TILES.with_label_values(&[cache, grid, zoom.to_string().as_str(), result]).inc();
 }
 
 /// `result`: see [`METATILES`]; `tiles` is 0 for errors.

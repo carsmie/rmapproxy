@@ -1,6 +1,5 @@
-//! Tile and metatile geometry, as `grid/tile_grid.py` and `grid/meta_grid.py`. Every
-//! rounding step here decides the BBOX/size of source requests, so it follows MapProxy
-//! literally.
+//! Tile and metatile geometry (`grid/tile_grid.py`, `grid/meta_grid.py`). Rounding decides source
+//! requests' BBOX/size, so it follows MapProxy literally.
 
 use crate::pyfloat::{floordiv, int, round_int, round_nd};
 use crate::srs::{BBox, Srs};

@@ -1,6 +1,6 @@
 //! MapProxy's file cache (`cache/file.py`, `cache/path.py`): `tc` layout, atomic writes,
-//! single-colour hardlinks and per-metatile flock files named like MapProxy's, so both can
-//! share one cache directory (and nginx serves either's tiles).
+//! single-colour hardlinks, flock files named like MapProxy's, so both (and nginx) share one cache
+//! directory.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -101,10 +101,9 @@ impl FileCache {
                 let _ = (&f).write_all(format!(" {}\n", std::process::id()).as_bytes());
                 return Ok(TileLock { path, _file: f });
             }
-            // Only EWOULDBLOCK means "held by another process". An NFS mount whose lock manager
-            // is unreachable from this node fails every flock (ENOLCK): waiting would time out on
-            // every metatile, so render unlocked — the cache's `nolock` NFS never coordinated
-            // across nodes anyway, and tiles are written by atomic rename.
+            // EWOULDBLOCK = held by another process. An unreachable NFS lock manager fails every
+            // flock (ENOLCK); waiting would time out every metatile, so render unlocked: `nolock`
+            // NFS never coordinated across nodes anyway, and tiles are written by atomic rename.
             let err = std::io::Error::last_os_error();
             match err.raw_os_error() {
                 Some(libc::EWOULDBLOCK) | Some(libc::EINTR) => {}

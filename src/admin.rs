@@ -1,11 +1,9 @@
-//! `serve --admin`: the cache admin API behind tnt-rmapproxy's `/_admin` GUI (replaces
-//! tnt-mapproxy's Python admin app). Seeds and cleanups run as `rmapproxy seed` child
-//! processes, one `--progress-file` per job; job records live in
-//! `<base_dir>/.rmapproxy-admin/`, so a stopped, failed or interrupted (pod restart) job can be
-//! continued. Other processes' `<base_dir>/.mapproxy_seed_progress.*` files (SKIPJobs,
-//! tnt-mapproxy's admin) are listed read-only. History stays in tnt-mapproxy's
-//! `.seed_history.json` format. A seed job can instead be distributed: split into chunks that
-//! `rmapproxy seed-worker` pods lease over `/_admin/work/*` (`work.rs`).
+//! `serve --admin`: the API behind the `/_admin` GUI (replaces tnt-mapproxy's Python admin). Seeds
+//! and cleanups run as `rmapproxy seed` children, one `--progress-file` per job; records in
+//! `<base_dir>/.rmapproxy-admin/` let stopped, failed or interrupted jobs continue. Other
+//! processes' `<base_dir>/.mapproxy_seed_progress.*` (SKIPJobs, tnt-mapproxy's admin) are listed
+//! read-only; history keeps `.seed_history.json`'s format. Seed jobs can instead go to `rmapproxy
+//! seed-worker` pods as chunks leased over `/_admin/work/*` (`work.rs`).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::os::unix::fs::MetadataExt;
@@ -94,9 +92,8 @@ struct WorkerInfo {
 /// After this many all-failed chunks in a row a worker gets no more chunks.
 const QUARANTINE_STREAK: u32 = 2;
 
-/// Failed chunks go back in the queue this many times when it drains, before the job fails:
-/// a source outage (rGIS OOMKill storm) outlasts source.rs's retries, and an unstored
-/// metatile leaves the old tile in the cache, i.e. a stale patch after a refresh=all reseed.
+/// Re-queues of failed chunks before the job fails: a source outage (rGIS OOMKill storm) outlasts
+/// source.rs's retries, and an unstored metatile leaves a stale patch after a refresh=all reseed.
 const AUTO_RETRY_ROUNDS: u32 = 2;
 
 /// A worker that has not called in for this long is not listed as connected.
@@ -1478,9 +1475,9 @@ fn stack_on_white(imgs: &[crate::image::Rgba]) -> crate::image::Rgba {
     out
 }
 
-/// Metatiles and tiles a task touches: the coverage extent's tile range per level, refined by
-/// the coverage test for levels with few metatiles; deeper levels reuse the last refined level's
-/// hit ratio. An estimate before refresh_before skips existing tiles.
+/// Metatiles and tiles a task touches: the coverage extent's tile range per level, refined by the
+/// coverage test where metatiles are few, else the last refined level's hit ratio. Estimated before
+/// refresh_before skips existing tiles.
 fn estimate_task(t: &seed::SeedTask) -> Result<(u64, u64)> {
     let mg = &t.cg.meta;
     let g = &mg.grid;

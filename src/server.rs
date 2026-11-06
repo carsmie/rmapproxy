@@ -122,14 +122,13 @@ async fn access_log(req: axum::extract::Request, next: axum::middleware::Next) -
 /// Request counts and durations by route pattern, never the raw path (client input, and
 /// unbounded as a label). Unrouted requests share one label; /healthz probes are skipped.
 async fn http_metrics(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
-    let route = req.extensions().get::<axum::extract::MatchedPath>().cloned();
-    let label = route.as_ref().map_or("unmatched", |p| p.as_str());
-    if label == "/healthz" {
+    let route = req.extensions().get::<axum::extract::MatchedPath>().map_or_else(|| "unmatched".to_string(), |p| p.as_str().to_string());
+    if route == "/healthz" {
         return next.run(req).await;
     }
     let t0 = std::time::Instant::now();
     let resp = next.run(req).await;
-    crate::metrics::http_request(label, resp.status().as_str(), t0.elapsed());
+    crate::metrics::http_request(&route, resp.status().as_u16(), t0.elapsed());
     resp
 }
 

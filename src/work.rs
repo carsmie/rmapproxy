@@ -1,9 +1,8 @@
-//! Distributed seeding. The admin (`serve --admin`) splits a GUI seed job into chunks — blocks
-//! of up to 16×16 metatiles of one task level that touch the task's coverage — and
-//! `rmapproxy seed-worker` pods lease them over HTTP (`/_admin/work/*`), render them with the
-//! seeder's own per-metatile code and report back. A lease that is not renewed (worker gone)
-//! puts its chunk back in the queue; done and failed chunks are kept as index ranges in the job
-//! record, so a job survives admin restarts and failed chunks can be retried.
+//! Distributed seeding. The admin (`serve --admin`) splits a GUI seed job into chunks (up to 16×16
+//! metatiles of one task level touching its coverage); `rmapproxy seed-worker` pods lease them over
+//! `/_admin/work/*`, render with the seeder's per-metatile code and report back. Unrenewed leases
+//! requeue; done and failed chunks are index ranges in the job record, so jobs survive admin
+//! restarts and failed chunks can be retried.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;

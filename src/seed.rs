@@ -250,9 +250,9 @@ pub async fn process_meta(mgr: &Arc<TileManager>, t: &Arc<SeedTask>, main: TileC
     if !needs_work(t, main) {
         return Ok(0);
     }
-    // A source error (on_error: transparent) leaves the metatile unstored: MapProxy's seeder
-    // counts that as done; here it is an error, so it shows in the summary/exit code and the
-    // resume point stays before it.
+    // A source error (on_error: transparent) leaves the metatile unstored. MapProxy counts it done;
+    // here it is an error, so it reaches the summary/exit code and the resume point stays before
+    // it.
     match mgr.create_meta(&t.cg, &meta, true).await? {
         (tiles, true) => Ok(tiles.len()),
         (_, false) => Err(anyhow!("not stored: a source failed (see the warnings above)")),

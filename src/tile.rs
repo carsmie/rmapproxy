@@ -15,7 +15,6 @@ use crate::cache::FileCache;
 use crate::config::{Config, ImageOpts};
 use crate::grid::{MetaGrid, MetaTile, TileCoord};
 use crate::image::{MergeMode, Rgba, encode_png_rgba};
-use crate::metrics::{TileCounters, TileResult};
 use crate::source::{SourceImage, WmsSource};
 
 /// One cache in one grid (MapProxy creates one TileManager per pair).
@@ -26,7 +25,6 @@ pub struct CacheGrid {
     pub meta: MetaGrid,
     pub sources: Vec<Arc<WmsSource>>,
     pub image: ImageOpts,
-    tile_counters: TileCounters,
     /// Metatiles being rendered on demand in this process: requests for tiles of the same
     /// metatile wait here instead of each polling the flock in a blocking thread.
     inflight: parking_lot::Mutex<HashMap<TileCoord, Arc<tokio::sync::Mutex<()>>>>,
@@ -131,7 +129,6 @@ impl TileManager {
                         cfg.globals.client_timeout,
                         cfg.globals.link_single_color,
                     ),
-                    tile_counters: TileCounters::new(&c.name, g, grid.res.len()),
                     meta: MetaGrid { grid, meta_size: c.meta_size, meta_buffer: c.meta_buffer },
                     sources: srcs.clone(),
                     image: c.image.clone(),
@@ -154,9 +151,9 @@ impl TileManager {
             bail!("tile {coord:?} out of range for grid {}", cg.grid);
         }
         let z = coord.2;
-        let count = |result| cg.tile_counters.inc(z, result);
+        let count = |result| crate::metrics::tile_request(&cg.cache, &cg.grid, z, result);
         if let Some(data) = cg.file.load(coord) {
-            count(TileResult::Hit);
+            count("hit");
             return Ok(Tile { data, mtime: cg.file.mtime(coord) });
         }
         let meta = cg.meta.meta_tile(coord);
@@ -165,7 +162,7 @@ impl TileManager {
         let _rendering = flight.slot.lock().await;
         // Rendered by another request of this process while we waited.
         if let Some(data) = cg.file.load(coord) {
-            count(TileResult::Coalesced);
+            count("coalesced");
             return Ok(Tile { data, mtime: cg.file.mtime(coord) });
         }
         let queued = std::time::Instant::now();
@@ -179,10 +176,10 @@ impl TileManager {
         let _lock = tokio::task::spawn_blocking(move || lock_cg.file.lock(main)).await??;
         // Another process may have created it while we waited for the lock.
         if let Some(data) = cg.file.load(coord) {
-            count(TileResult::Coalesced);
+            count("coalesced");
             return Ok(Tile { data, mtime: cg.file.mtime(coord) });
         }
-        count(TileResult::Miss);
+        count("miss");
         let (tiles, _) = self.create_meta(cg, &meta, true).await?;
         tiles
             .into_iter()
