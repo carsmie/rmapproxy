@@ -150,7 +150,10 @@ impl TileManager {
         if !cg.meta.grid.contains(coord) {
             bail!("tile {coord:?} out of range for grid {}", cg.grid);
         }
+        let z = coord.2;
+        let count = |result| crate::metrics::tile_request(&cg.cache, &cg.grid, z, result);
         if let Some(data) = cg.file.load(coord) {
+            count("hit");
             return Ok(Tile { data, mtime: cg.file.mtime(coord) });
         }
         let meta = cg.meta.meta_tile(coord);
@@ -159,18 +162,24 @@ impl TileManager {
         let _rendering = flight.slot.lock().await;
         // Rendered by another request of this process while we waited.
         if let Some(data) = cg.file.load(coord) {
+            count("coalesced");
             return Ok(Tile { data, mtime: cg.file.mtime(coord) });
         }
+        let queued = std::time::Instant::now();
         let _permit = match &self.renders {
             Some(s) => Some(s.acquire().await?),
             None => None,
         };
+        crate::metrics::render_queue_waited(queued.elapsed());
+        let _in_flight = crate::metrics::render_in_flight();
         let lock_cg = cg.clone();
         let _lock = tokio::task::spawn_blocking(move || lock_cg.file.lock(main)).await??;
         // Another process may have created it while we waited for the lock.
         if let Some(data) = cg.file.load(coord) {
+            count("coalesced");
             return Ok(Tile { data, mtime: cg.file.mtime(coord) });
         }
+        count("miss");
         let (tiles, _) = self.create_meta(cg, &meta, true).await?;
         tiles
             .into_iter()
@@ -182,6 +191,19 @@ impl TileManager {
     /// Render a metatile and (if all sources succeeded and `store`) write all its tiles.
     /// Returns the encoded tiles and whether they were stored.
     pub async fn create_meta(&self, cg: &Arc<CacheGrid>, meta: &MetaTile, store: bool) -> Result<(Vec<(TileCoord, Vec<u8>)>, bool)> {
+        let t0 = std::time::Instant::now();
+        let r = self.render_meta(cg, meta, store).await;
+        let (result, tiles) = match &r {
+            Ok((t, true)) => ("stored", t.len()),
+            Ok((t, false)) if store => ("not_cached", t.len()),
+            Ok((t, false)) => ("not_stored", t.len()),
+            Err(_) => ("error", 0),
+        };
+        crate::metrics::metatile(&cg.cache, &cg.grid, result, tiles, t0.elapsed());
+        r
+    }
+
+    async fn render_meta(&self, cg: &Arc<CacheGrid>, meta: &MetaTile, store: bool) -> Result<(Vec<(TileCoord, Vec<u8>)>, bool)> {
         let t0 = std::time::Instant::now();
         let srs = &cg.meta.grid.srs;
         let size = meta.size;

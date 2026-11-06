@@ -22,6 +22,8 @@ source URL and per-metatile timings.
 
 `RMAPPROXY_MAX_RENDERS` (default 32, 0 = unbounded) caps the metatiles `serve` renders on
 demand at once; requests for tiles of a metatile already being rendered wait for it.
+`RMAPPROXY_METRICS_ADDR` (default off) serves Prometheus `GET /metrics` from `serve` and
+`seed-worker` on its own port, so metrics stay off the public service port.
 `/_admin` sends no CORS headers and refuses non-GET requests from other sites. With
 `RMAPPROXY_WORKER_TOKEN` set on the admin and the workers, `/_admin/work/*` requires it as a
 bearer token.

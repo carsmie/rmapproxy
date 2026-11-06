@@ -17,6 +17,7 @@ libc = "0.2"
 md-5 = "0.11"
 parking_lot = "0.12.5"
 png = "0.18.1"
+prometheus = { version = "0.14", default-features = false }
 proj4rs = "0.3.0"
 rand = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }

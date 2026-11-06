@@ -283,3 +283,34 @@ async fn distributed_failed_chunks_are_retried_before_the_job_fails() {
     // Down on every round: two automatic retries, then failed (Fortsett is left).
     assert_eq!(run_distributed(&base, |_| 1).await, (3, "failed".into()));
 }
+
+/// Renders, coalesced waits, source retries and routes are counted; client input is not a label.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn metrics_count_tiles_and_sources_without_client_labels() {
+    let env = Env::new("metrics").await;
+    let base = spawn(crate::server::app(env.mgr(0), None).unwrap()).await;
+    let tile = tile_url(&base, 0, 0);
+    env.wms.fail_next.store(1, Ordering::SeqCst);
+    assert_eq!(get_all(vec![tile.clone(), tile.clone()]).await, vec![200, 200]);
+    assert_eq!(get_all(vec![tile]).await, vec![200]);
+    reqwest::get(format!("{base}/minted-path-label")).await.unwrap();
+    reqwest::get(format!("{base}/healthz")).await.unwrap();
+
+    let metrics = spawn(crate::metrics::router()).await;
+    let text = reqwest::get(format!("{metrics}/metrics")).await.unwrap().text().await.unwrap();
+    for want in [
+        r#"rmapproxy_tile_requests_total{cache="c",grid="g",result="miss",zoom="1"} "#,
+        r#"rmapproxy_tile_requests_total{cache="c",grid="g",result="coalesced",zoom="1"} "#,
+        r#"rmapproxy_tile_requests_total{cache="c",grid="g",result="hit",zoom="1"} "#,
+        r#"rmapproxy_metatiles_total{cache="c",grid="g",result="stored"} "#,
+        r#"rmapproxy_source_requests_total{result="retry",source="s1"} "#,
+        r#"rmapproxy_http_requests_total{route="/wmts/1.0.0/{layer}/{style}/{set}/{z}/{row}/{file}",status="200"} "#,
+        r#"rmapproxy_http_requests_total{route="unmatched",status="404"} "#,
+    ] {
+        // s1 or s2 draws the injected 503, whichever asks first.
+        let want_alt = want.replace("s1", "s2");
+        assert!(text.contains(want) || text.contains(&want_alt), "{want}\n{text}");
+    }
+    assert!(!text.contains("minted-path-label") && !text.contains("healthz"), "{text}");
+    assert!(reqwest::get(format!("{base}/metrics")).await.unwrap().text().await.unwrap().contains("ExceptionReport"));
+}

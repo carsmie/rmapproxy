@@ -67,7 +67,7 @@ pub fn app(mgr: Arc<TileManager>, admin: Option<crate::admin::AdminOpts>) -> any
         info!("admin API on /_admin");
         router = router.merge(crate::admin::router(a));
     }
-    Ok(router.layer(axum::middleware::from_fn(access_log)))
+    Ok(router.layer(axum::middleware::from_fn(access_log)).layer(axum::middleware::from_fn(http_metrics)))
 }
 
 /// SIGTERM (pod shutdown) or SIGINT: in-flight requests finish, new connections are refused.
@@ -116,6 +116,19 @@ async fn access_log(req: axum::extract::Request, next: axum::middleware::Next) -
         resp.status().as_u16(),
         t0.elapsed().as_millis()
     );
+    resp
+}
+
+/// Request counts and durations by route pattern, never the raw path (client input, and
+/// unbounded as a label). Unrouted requests share one label; /healthz probes are skipped.
+async fn http_metrics(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let route = req.extensions().get::<axum::extract::MatchedPath>().map_or_else(|| "unmatched".to_string(), |p| p.as_str().to_string());
+    if route == "/healthz" {
+        return next.run(req).await;
+    }
+    let t0 = std::time::Instant::now();
+    let resp = next.run(req).await;
+    crate::metrics::http_request(&route, resp.status().as_u16(), t0.elapsed());
     resp
 }
 

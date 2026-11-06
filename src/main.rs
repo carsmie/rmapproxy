@@ -8,6 +8,7 @@ mod coverage;
 mod e2e_tests;
 mod grid;
 mod image;
+mod metrics;
 mod pickle;
 mod pyfloat;
 mod quantize;
@@ -121,6 +122,7 @@ fn main() -> Result<()> {
                     })
                 })
                 .transpose()?;
+            rt.block_on(metrics::start())?;
             rt.block_on(server::serve(mgr, &bind, admin))
         }
         Some("seed") => {
@@ -144,6 +146,7 @@ fn main() -> Result<()> {
             let admin_url = flag("--admin").context("--admin URL")?;
             let name = flag("--name").or_else(|| std::env::var("HOSTNAME").ok()).unwrap_or_else(|| "worker".into());
             let bind = flag("--bind").unwrap_or_else(|| "0.0.0.0:8080".into());
+            rt.block_on(metrics::start())?;
             rt.block_on(work::run_worker(mgr, admin_url, name, bind))
         }
         Some("tile") => {

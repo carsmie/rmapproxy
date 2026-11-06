@@ -204,17 +204,29 @@ impl WmsSource {
         let url = self.getmap_url(bbox, size, srs);
         debug!("source {}: {url}", self.conf.name);
         let mut backoff = RETRY_BACKOFF.iter();
+        let attempted = |result, t0: std::time::Instant, bytes| crate::metrics::source_attempt(&self.conf.name, result, t0.elapsed(), bytes);
         loop {
+            let t0 = std::time::Instant::now();
             match self.request_once(&url).await {
                 Err(Attempt::Transient(e)) => match backoff.next() {
                     Some(d) => {
+                        attempted("retry", t0, 0);
                         warn!("source {}: {e:#}; retrying in {d:?}", self.conf.name);
                         tokio::time::sleep(*d).await;
                     }
-                    None => return Err(e),
+                    None => {
+                        attempted("error", t0, 0);
+                        return Err(e);
+                    }
                 },
-                Err(Attempt::Fatal(e)) => return Err(e),
-                Ok(body) => return Ok(body),
+                Err(Attempt::Fatal(e)) => {
+                    attempted("error", t0, 0);
+                    return Err(e);
+                }
+                Ok(body) => {
+                    attempted("ok", t0, body.len());
+                    return Ok(body);
+                }
             }
         }
     }
