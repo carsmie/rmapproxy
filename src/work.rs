@@ -61,6 +61,8 @@ pub struct Queue {
     pub per_task: Vec<(u64, u64)>,
     pub tiles: u64,
     pub errors: u64,
+    /// Automatic retry rounds of failed chunks done so far (see admin `AUTO_RETRY_ROUNDS`).
+    pub auto_retries: u32,
 }
 
 impl Queue {
@@ -116,6 +118,7 @@ impl Queue {
             per_task,
             tiles: 0,
             errors: 0,
+            auto_retries: 0,
         })
     }
 
@@ -514,6 +517,7 @@ mod tests {
             est_done: 0,
             tiles: 0,
             errors: 0,
+            auto_retries: 0,
         }
     }
 

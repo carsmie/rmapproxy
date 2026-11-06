@@ -94,6 +94,11 @@ struct WorkerInfo {
 /// After this many all-failed chunks in a row a worker gets no more chunks.
 const QUARANTINE_STREAK: u32 = 2;
 
+/// Failed chunks go back in the queue this many times when it drains, before the job fails:
+/// a source outage (rGIS OOMKill storm) outlasts source.rs's retries, and an unstored
+/// metatile leaves the old tile in the cache, i.e. a stale patch after a refresh=all reseed.
+const AUTO_RETRY_ROUNDS: u32 = 2;
+
 /// A worker that has not called in for this long is not listed as connected.
 const WORKER_SEEN_SECS: u64 = 60;
 
@@ -1089,7 +1094,13 @@ impl Admin {
             }
             j.tiles = q.tiles;
             j.errors = q.errors;
-            if q.finished() && j.state == "running" {
+            if q.finished() && j.state == "running" && q.failed > 0 && q.auto_retries < AUTO_RETRY_ROUNDS {
+                q.auto_retries += 1;
+                j.log.push_back(format!("Prøver {} feilede chunks på nytt (runde {}/{AUTO_RETRY_ROUNDS}).", q.failed, q.auto_retries));
+                info!("admin: distributed job {job}: auto-retry {} failed chunks (round {})", q.failed, q.auto_retries);
+                q.retry_failed();
+                self.persist(j);
+            } else if q.finished() && j.state == "running" {
                 let failed = q.failed;
                 j.state = if failed == 0 { "done" } else { "failed" };
                 j.exit_code = Some(if failed == 0 { 0 } else { 1 });

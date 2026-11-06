@@ -235,3 +235,51 @@ async fn seeding_renders_the_coverage_and_refresh_skips_fresh_tiles() {
     crate::seed::run(mgr.clone(), tasks("s"), crate::seed::Mode::Seed, 4, None).await.unwrap();
     assert_eq!(env.requests(), 8);
 }
+
+/// POST JSON to the admin; (status, parsed body or Null).
+async fn admin_post(base: &str, path: &str, body: serde_json::Value) -> (u16, serde_json::Value) {
+    let r = reqwest::Client::new()
+        .post(format!("{base}/_admin/{path}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(body.to_string())
+        .send()
+        .await
+        .unwrap();
+    let status = r.status().as_u16();
+    (status, serde_json::from_slice(&r.bytes().await.unwrap()).unwrap_or_default())
+}
+
+/// Run a one-chunk distributed job of task `s` with a fake worker whose chunk round `n`
+/// (1-based) reports `errors(n)` failed metatiles; (rounds claimed, final job state).
+async fn run_distributed(base: &str, errors: impl Fn(u32) -> u64) -> (u32, String) {
+    let (_, job) = admin_post(base, "jobs", serde_json::json!({"tasks": [{"name": "s", "levels_from": 1, "levels_to": 1}], "distributed": true})).await;
+    let id = job["id"].as_str().expect("job id").to_string();
+    let mut rounds = 0;
+    loop {
+        let (status, c) = admin_post(base, "work/claim", serde_json::json!({"worker": "w"})).await;
+        if status == 204 {
+            break;
+        }
+        rounds += 1;
+        let body = serde_json::json!({"worker": "w", "job": id, "chunk": c["chunk"], "tiles": 16, "errors": errors(rounds), "metatiles": 2});
+        admin_post(base, "work/complete", body).await;
+    }
+    let r = reqwest::get(format!("{base}/_admin/jobs/{id}")).await.unwrap().bytes().await.unwrap();
+    let j: serde_json::Value = serde_json::from_slice(&r).unwrap();
+    (rounds, j["state"].as_str().unwrap_or_default().to_string())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn distributed_failed_chunks_are_retried_before_the_job_fails() {
+    let env = Env::new("autoretry").await;
+    let opts = crate::admin::AdminOpts {
+        mapproxy_conf: env.dir.join("mapproxy.yaml"),
+        seed_conf: env.dir.join("seed.yaml"),
+        assets: env.dir.join("admin"),
+    };
+    let base = spawn(crate::server::app(env.mgr(0), Some(opts)).unwrap()).await;
+    // Source down for two rounds (rGIS OOM storm), then fine: the job ends done.
+    assert_eq!(run_distributed(&base, |n| (n <= 2) as u64).await, (3, "done".into()));
+    // Down on every round: two automatic retries, then failed (Fortsett is left).
+    assert_eq!(run_distributed(&base, |_| 1).await, (3, "failed".into()));
+}
