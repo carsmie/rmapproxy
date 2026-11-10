@@ -235,11 +235,18 @@ pub fn encode_png_paletted(w: u32, h: u32, palette: &[[u8; 3]], idx: &[u8], tran
 /// RGB channels to colors-1 entries, then index 255 where alpha <= 128.
 pub fn quantize_mediancut_alpha(img: &Rgba, colors: u32) -> (Vec<[u8; 3]>, Vec<u8>) {
     let rgb: Vec<[u8; 3]> = img.px.as_chunks::<4>().0.iter().map(|p| [p[0], p[1], p[2]]).collect();
-    let (pal, mut idx) = crate::quantize::mediancut(&rgb, colors - 1);
+    let (mut pal, mut idx) = crate::quantize::mediancut(&rgb, colors - 1);
+    let mut any_transparent = false;
     for (i, p) in img.px.as_chunks::<4>().0.iter().enumerate() {
         if p[3] <= 128 {
             idx[i] = 255;
+            any_transparent = true;
         }
+    }
+    // Index 255 must exist in PLTE/tRNS: mediancut yields ≤255 entries, so without padding the
+    // transparent index fell outside the palette and decoded as opaque black (2x tiles, 2026-11-10).
+    if any_transparent {
+        pal.resize(256, [BLANK[0], BLANK[1], BLANK[2]]);
     }
     (pal, idx)
 }
@@ -258,6 +265,21 @@ mod tests {
         dst.alpha_composite(&src);
         let bad = dst.px.chunks(4).zip(want.px.chunks(4)).filter(|(a, b)| a != b).count();
         assert_eq!(bad, 0, "{bad} pixels differ from Pillow");
+    }
+
+    /// Transparent pixels (index 255) must decode transparent, not as out-of-palette black.
+    #[test]
+    fn mediancut_alpha_transparent_roundtrips() {
+        let mut img = Rgba::filled(4, 4, [0, 0, 0, 0]);
+        for (i, p) in img.px.chunks_mut(4).enumerate().take(8) {
+            p.copy_from_slice(&[10 * i as u8, 100, 200, 255]);
+        }
+        let (pal, idx) = quantize_mediancut_alpha(&img, 256);
+        assert_eq!(pal.len(), 256);
+        let png = encode_png_paletted(4, 4, &pal, &idx, true, png::Compression::Fast).unwrap();
+        let (out, _) = decode_png(&png).unwrap();
+        assert!(out.px.chunks(4).skip(8).all(|p| p[3] == 0), "transparent half not transparent");
+        assert!(out.px.chunks(4).take(8).all(|p| p[3] == 255));
     }
 
     #[test]
