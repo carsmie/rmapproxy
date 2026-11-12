@@ -348,9 +348,15 @@ impl Merger {
 
 fn encode(img: &Rgba, opts: &ImageOpts) -> Result<Vec<u8>> {
     if let Some(colors) = opts.colors {
-        if opts.quantizer.as_deref() == Some("mediancut") {
-            // Caches here are transparent (checked in TileManager::new): MapProxy's alpha path.
-            let (pal, idx) = crate::image::quantize_mediancut_alpha(img, colors);
+        // Caches here are transparent (checked in TileManager::new): MapProxy's alpha path.
+        type Quant = fn(&Rgba, u32) -> (Vec<[u8; 3]>, Vec<u8>);
+        let quant: Option<Quant> = match opts.quantizer.as_deref() {
+            Some("mediancut") => Some(crate::image::quantize_mediancut_alpha),
+            Some("mediancut_spot") => Some(crate::image::quantize_mediancut_spot_alpha),
+            _ => None,
+        };
+        if let Some(q) = quant {
+            let (pal, idx) = q(img, colors);
             return crate::image::encode_png_paletted(img.w, img.h, &pal, &idx, true, png::Compression::Balanced);
         }
         // TODO(parity): Pillow's fastoctree (the default quantizer).

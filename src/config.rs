@@ -25,7 +25,7 @@ pub struct Globals {
 pub struct ImageOpts {
     /// `image.colors` (0/None = no quantising).
     pub colors: Option<u32>,
-    /// `encoding_options.quantizer`: fastoctree (default) or mediancut.
+    /// `encoding_options.quantizer`: fastoctree (default), mediancut, or mediancut_spot (rMapproxy only).
     pub quantizer: Option<String>,
     pub transparent: Option<bool>,
 }

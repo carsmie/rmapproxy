@@ -234,8 +234,97 @@ pub fn encode_png_paletted(w: u32, h: u32, palette: &[[u8; 3]], idx: &[u8], tran
 /// MapProxy `quantize(img, colors, alpha=True, quantizer='mediancut')`: median cut of the
 /// RGB channels to colors-1 entries, then index 255 where alpha <= 128.
 pub fn quantize_mediancut_alpha(img: &Rgba, colors: u32) -> (Vec<[u8; 3]>, Vec<u8>) {
-    let rgb: Vec<[u8; 3]> = img.px.as_chunks::<4>().0.iter().map(|p| [p[0], p[1], p[2]]).collect();
-    let (mut pal, mut idx) = crate::quantize::mediancut(&rgb, colors - 1);
+    let rgb = rgb_of(img);
+    let (pal, idx) = crate::quantize::mediancut(&rgb, colors - 1);
+    apply_alpha(img, pal, idx)
+}
+
+/// Spot colours: bins (8 levels/channel) with at least this many opaque pixels...
+const SPOT_MIN_PX: u32 = 24;
+/// ...whose pixels sit on average further than this (RGB distance) from their entry...
+const SPOT_MAX_ERR: u32 = 16;
+/// ...get an entry for the bin's most common exact colour. Slots taken from median cut at most:
+const SPOT_MAX: usize = 32;
+
+/// `quantizer: mediancut_spot` (rMapproxy only): median cut plus reserved entries for small flat
+/// symbol colours. Median cut splits by population, so a shield or road core of a few hundred px
+/// in a 512 px tile drops out of the palette and maps far off (E6 shield 84,140,56 → 95,90,81 grey,
+/// motorway core 255,255,0 → 248,243,134; Svinesund 2x tiles 2026-11-11). Bins, not exact colours:
+/// thin lines are mostly anti-aliased shades. No such bins → output identical to `mediancut`.
+pub fn quantize_mediancut_spot_alpha(img: &Rgba, colors: u32) -> (Vec<[u8; 3]>, Vec<u8>) {
+    use std::collections::HashMap;
+    let rgb = rgb_of(img);
+    let (pal, idx) = crate::quantize::mediancut(&rgb, colors - 1);
+    let opaque = |i: usize| img.px[i * 4 + 3] > 128;
+    // Exact-colour histogram of opaque pixels, with median cut's entry for that colour.
+    let mut hist: HashMap<[u8; 3], (u32, u8)> = HashMap::new();
+    for (i, &c) in rgb.iter().enumerate() {
+        if opaque(i) {
+            hist.entry(c).or_insert((0, idx[i])).0 += 1;
+        }
+    }
+    // Per bin: pixels, summed squared error, most common exact colour (count, colour).
+    type Bin = (u32, u64, (u32, [u8; 3]));
+    let mut bins: HashMap<[u8; 3], Bin> = HashMap::new();
+    for (&c, &(n, e)) in &hist {
+        let b = bins.entry([c[0] >> 5, c[1] >> 5, c[2] >> 5]).or_insert((0, 0, (0, c)));
+        b.0 += n;
+        b.1 += n as u64 * dist2(c, pal[e as usize]) as u64;
+        if (n, c) > b.2 {
+            b.2 = (n, c);
+        }
+    }
+    let lim = (SPOT_MAX_ERR * SPOT_MAX_ERR) as u64;
+    let mut cand: Vec<([u8; 3], u64)> =
+        bins.values().filter(|(n, se, _)| *n >= SPOT_MIN_PX && *se > lim * *n as u64).map(|(_, se, (_, c))| (*c, *se)).collect();
+    if cand.is_empty() {
+        return apply_alpha(img, pal, idx);
+    }
+    // Most total error first; a near-duplicate of a chosen spot is covered by it.
+    cand.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let far = |a: [u8; 3], b: [u8; 3]| dist2(a, b) > SPOT_MAX_ERR * SPOT_MAX_ERR;
+    let mut spots: Vec<[u8; 3]> = Vec::new();
+    for (c, _) in cand {
+        if spots.len() == SPOT_MAX {
+            break;
+        }
+        if spots.iter().all(|s| far(*s, c)) {
+            spots.push(c);
+        }
+    }
+    // Rerun with the slots left; a pixel moves to a spot only if it is closer than its entry.
+    let (mut pal, mut idx) = crate::quantize::mediancut(&rgb, colors - 1 - spots.len() as u32);
+    let base = pal.len();
+    pal.extend_from_slice(&spots);
+    let mut memo: HashMap<([u8; 3], u8), u8> = HashMap::new();
+    for (i, &c) in rgb.iter().enumerate() {
+        let cur = idx[i];
+        idx[i] = *memo.entry((c, cur)).or_insert_with(|| {
+            let (mut best, mut bd) = (cur, dist2(c, pal[cur as usize]));
+            for (j, s) in spots.iter().enumerate() {
+                let d = dist2(c, *s);
+                if d < bd {
+                    (best, bd) = ((base + j) as u8, d);
+                }
+            }
+            best
+        });
+    }
+    apply_alpha(img, pal, idx)
+}
+
+fn rgb_of(img: &Rgba) -> Vec<[u8; 3]> {
+    img.px.as_chunks::<4>().0.iter().map(|p| [p[0], p[1], p[2]]).collect()
+}
+
+#[inline]
+fn dist2(a: [u8; 3], b: [u8; 3]) -> u32 {
+    let d = |i: usize| a[i] as i32 - b[i] as i32;
+    (d(0) * d(0) + d(1) * d(1) + d(2) * d(2)) as u32
+}
+
+/// MapProxy's alpha=True step: index 255 where alpha <= 128.
+fn apply_alpha(img: &Rgba, mut pal: Vec<[u8; 3]>, mut idx: Vec<u8>) -> (Vec<[u8; 3]>, Vec<u8>) {
     let mut any_transparent = false;
     for (i, p) in img.px.as_chunks::<4>().0.iter().enumerate() {
         if p[3] <= 128 {
@@ -280,6 +369,87 @@ mod tests {
         let (out, _) = decode_png(&png).unwrap();
         assert!(out.px.chunks(4).skip(8).all(|p| p[3] == 0), "transparent half not transparent");
         assert!(out.px.chunks(4).take(8).all(|p| p[3] == 255));
+    }
+
+    /// 512² of smooth 3-channel noise-free gradient (fills median cut's boxes) + a 24×20 shield.
+    fn gradient_with_shield(shield: [u8; 3]) -> Rgba {
+        let mut img = Rgba::filled(512, 512, [0, 0, 0, 255]);
+        for (i, p) in img.px.chunks_mut(4).enumerate() {
+            let (x, y) = ((i % 512) as u32, (i / 512) as u32);
+            p[..3].copy_from_slice(&[(150 + x / 8) as u8, (180 + (x + y) / 32) as u8, (90 + y / 6) as u8]);
+            if (200..224).contains(&x) && (300..320).contains(&y) {
+                p[..3].copy_from_slice(&shield);
+            }
+        }
+        img
+    }
+
+    fn decoded_px(pal: &[[u8; 3]], idx: &[u8], i: usize) -> [u8; 3] {
+        pal[idx[i] as usize]
+    }
+
+    #[test]
+    fn spot_keeps_small_flat_symbol_colour() {
+        let green = [84, 140, 56];
+        let img = gradient_with_shield(green);
+        let at = 310 * 512 + 210;
+        let (pal, idx) = quantize_mediancut_alpha(&img, 256);
+        assert!(dist2(decoded_px(&pal, &idx, at), green) > 16 * 16, "fixture must reproduce the bug");
+        let (pal, idx) = quantize_mediancut_spot_alpha(&img, 256);
+        assert_eq!(decoded_px(&pal, &idx, at), green);
+        assert!(pal.len() <= 255 && idx.iter().all(|&i| (i as usize) < pal.len()));
+    }
+
+    #[test]
+    fn spot_without_spots_equals_mediancut() {
+        let mut img = Rgba::filled(64, 64, [0, 0, 0, 255]);
+        for (i, p) in img.px.chunks_mut(4).enumerate() {
+            p[..3].copy_from_slice(&[(i % 64 * 4) as u8, (i / 64 * 4) as u8, 128]);
+        }
+        assert_eq!(quantize_mediancut_spot_alpha(&img, 256), quantize_mediancut_alpha(&img, 256));
+    }
+
+    /// Spot pass on real renders: `QUANT_EVAL_DIR=<dir of RGBA PNGs> cargo test --release
+    /// quant_eval -- --ignored --nocapture`. Prints PSNR and mean error over pixels within 40 of a style colour.
+    #[test]
+    #[ignore]
+    fn quant_eval() {
+        let dir = std::env::var("QUANT_EVAL_DIR").expect("QUANT_EVAL_DIR");
+        let style: [(&str, [u8; 3]); 4] =
+            [("shield", [84, 140, 56]), ("mwy-core", [255, 255, 0]), ("mwy-fill", [230, 104, 104]), ("riksveg", [255, 255, 254])];
+        let mut files: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).collect();
+        files.sort();
+        for f in files.iter().filter(|f| f.extension().is_some_and(|e| e == "png")) {
+            let (img, _) = decode_png(&std::fs::read(f).unwrap()).unwrap();
+            type Quant = fn(&Rgba, u32) -> (Vec<[u8; 3]>, Vec<u8>);
+        let qs: [(&str, Quant); 2] = [("mediancut", quantize_mediancut_alpha), ("spot", quantize_mediancut_spot_alpha)];
+        for (name, q) in qs {
+                let t = std::time::Instant::now();
+                let (pal, idx) = q(&img, 256);
+                let ms = t.elapsed().as_secs_f64() * 1e3;
+                let (mut se, mut n) = (0f64, 0f64);
+                let mut near = [(0f64, 0u32); 4];
+                for (i, p) in img.px.as_chunks::<4>().0.iter().enumerate() {
+                    if p[3] <= 128 {
+                        continue;
+                    }
+                    let c = [p[0], p[1], p[2]];
+                    let d = dist2(c, decoded_px(&pal, &idx, i));
+                    se += d as f64;
+                    n += 3.0;
+                    for (k, (_, s)) in style.iter().enumerate() {
+                        if dist2(c, *s) <= 40 * 40 {
+                            near[k].0 += (d as f64).sqrt();
+                            near[k].1 += 1;
+                        }
+                    }
+                }
+                let kb = encode_png_paletted(img.w, img.h, &pal, &idx, true, png::Compression::Balanced).unwrap().len() / 1024;
+                let psnr = 10.0 * (255.0f64 * 255.0 / (se / n)).log10();
+                let w: Vec<String> = style.iter().zip(near).map(|((s, _), (e, n))| format!("{s}={:.1}/{n}", e / n.max(1) as f64)).collect();
+                println!("{} {name:9} psnr {psnr:.2} dB {ms:.0} ms {kb} KiB pal {} mean-err near {}", f.file_name().unwrap().to_string_lossy(), pal.len(), w.join(" "));
+            }
+        }
     }
 
     #[test]
