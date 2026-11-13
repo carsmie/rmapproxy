@@ -1321,9 +1321,10 @@ impl Admin {
         }
         std::fs::create_dir_all(&self.legend_dir)?;
         let client = reqwest::Client::builder().timeout(Duration::from_secs(30)).build()?;
-        // Labels need a font; without one the legend is symbols only (as before).
+        // Labels need a font: without one, fail rather than overwrite labelled legends with
+        // symbol-only ones (happened 2026-11-13: image lacked font-noto).
         let font = std::env::var_os("RMAPPROXY_LEGEND_FONT").map(PathBuf::from).unwrap_or_else(|| "/usr/share/fonts/noto/NotoSans-Regular.ttf".into());
-        let text = crate::legend::Text::load(&font).map_err(|e| warn!("legend font: {e}; symbols only")).ok();
+        let text = Some(crate::legend::Text::load(&font).with_context(|| format!("legend font {}", font.display()))?);
         let (mut made, mut failed) = (vec![], vec![]);
         for scale in LEGEND_SCALES {
             let out = self.legend_dir.join(format!("topo-{scale}.png"));
