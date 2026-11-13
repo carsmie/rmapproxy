@@ -80,8 +80,8 @@ change tiles relative to MapProxy.
 
 ## Not yet
 
-1. `fastoctree` quantizer (MapProxy's default, only `qgis_hoydekurve_cache` uses it): written
-   as RGBA with a warning.
+1. `fastoctree` quantizer (MapProxy's default; no tnt cache uses it since the per-layer
+   `qgis_*_cache` caches were removed): written as RGBA with a warning.
 2. WMS GetFeatureInfo / GetLegendGraphic / `tiled=true` (WMS-C); JPEG is encoded with
    `jpeg-encoder` (not byte-identical to Pillow's libjpeg); the `/demo` UI.
 3. Seeding: `refresh_before.time/mtime`, multiple coverages per task.

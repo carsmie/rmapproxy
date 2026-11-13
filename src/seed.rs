@@ -65,16 +65,69 @@ fn levels_of(v: Option<&Value>, max: usize) -> Vec<usize> {
     }
 }
 
-/// `before_timestamp_from_options` (weeks/days/hours/minutes/seconds).
+/// `before_timestamp_from_options`: `time` (ISO 8601, naive = UTC = MapProxy's local time in
+/// our containers), `mtime` (a file's) or weeks/days/hours/minutes/seconds ago.
 fn before_timestamp(v: Option<&Value>) -> Result<Option<SystemTime>> {
     let Some(v) = v else { return Ok(None) };
-    if v.get("time").is_some() || v.get("mtime").is_some() {
-        bail!("refresh_before/remove_before time/mtime not supported");
+    if let Some(t) = v.get("time") {
+        let s = t.as_str().ok_or_else(|| anyhow!("refresh_before/remove_before time: expected an ISO 8601 string, got {t:?}"))?;
+        return parse_iso_time(s).map(Some);
+    }
+    if let Some(p) = v.get("mtime") {
+        let p = p.as_str().ok_or_else(|| anyhow!("refresh_before/remove_before mtime: expected a path"))?;
+        return Ok(Some(std::fs::metadata(p).and_then(|m| m.modified()).with_context(|| format!("mtime of {p}"))?));
     }
     let secs = |k: &str, f: f64| v.get(k).and_then(|x| x.as_f64().or(x.as_i64().map(|i| i as f64))).unwrap_or(0.0) * f;
     let delta = secs("weeks", 604800.0) + secs("days", 86400.0) + secs("hours", 3600.0) + secs("minutes", 60.0) + secs("seconds", 1.0);
     let delta = Duration::try_from_secs_f64(delta).map_err(|_| anyhow!("invalid refresh_before/remove_before {v:?}"))?;
     Ok(Some(SystemTime::now().checked_sub(delta).unwrap_or(SystemTime::UNIX_EPOCH)))
+}
+
+/// `YYYY-MM-DD[T ]HH:MM[:SS[.fff]][Z|±HH[:]MM]` → time; no offset = UTC.
+pub fn parse_iso_time(s: &str) -> Result<SystemTime> {
+    let bad = || anyhow!("invalid ISO 8601 time {s:?} (want e.g. 2026-11-12T06:28:00Z)");
+    let s = s.trim();
+    let (date, rest) = s.split_at(s.find(['T', ' ']).ok_or_else(bad)?);
+    let rest = &rest[1..];
+    let d: Vec<i64> = date.split('-').map(|p| p.parse().map_err(|_| bad())).collect::<Result<_>>()?;
+    let [y, mo, da] = d[..] else { return Err(bad()) };
+    // Clock, then optional Z / ±offset.
+    let (clock, off_secs) = if let Some(c) = rest.strip_suffix(['Z', 'z']) {
+        (c, 0)
+    } else if let Some(i) = rest.rfind(['+', '-']) {
+        let (c, o) = rest.split_at(i);
+        let sign = if o.starts_with('-') { -1 } else { 1 };
+        let digits: String = o[1..].chars().filter(|c| c.is_ascii_digit()).collect();
+        if digits.len() != 4 {
+            return Err(bad());
+        }
+        let (h, m): (i64, i64) = (digits[..2].parse()?, digits[2..].parse()?);
+        (c, sign * (h * 3600 + m * 60))
+    } else {
+        (rest, 0)
+    };
+    let c: Vec<&str> = clock.split(':').collect();
+    if !(2..=3).contains(&c.len()) {
+        return Err(bad());
+    }
+    let h: i64 = c[0].parse().map_err(|_| bad())?;
+    let mi: i64 = c[1].parse().map_err(|_| bad())?;
+    let sec: f64 = c.get(2).map_or(Ok(0.0), |v| v.parse()).map_err(|_| bad())?;
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&da) || h > 23 || mi > 59 || !(0.0..61.0).contains(&sec) {
+        return Err(bad());
+    }
+    // days_from_civil (Howard Hinnant).
+    let yy = if mo <= 2 { y - 1 } else { y };
+    let era = yy.div_euclid(400);
+    let yoe = yy - era * 400;
+    let doy = (153 * (mo + if mo > 2 { -3 } else { 9 }) + 2) / 5 + da - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    let secs = days as f64 * 86400.0 + (h * 3600 + mi * 60 - off_secs) as f64 + sec;
+    if secs < 0.0 {
+        return Err(bad());
+    }
+    Ok(SystemTime::UNIX_EPOCH + Duration::from_secs_f64(secs))
 }
 
 /// Tasks named in `names` from the `seeds:` or `cleanups:` section (one per cache × grid).
@@ -581,4 +634,44 @@ fn clock() -> String {
     let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs();
     let s = now % 86400;
     format!("{:02}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn epoch(s: &str) -> u64 {
+        parse_iso_time(s).unwrap().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs()
+    }
+
+    #[test]
+    fn iso_times() {
+        // 2026-11-12T06:28:00Z = 1794464880 (date -u -d ... +%s).
+        assert_eq!(epoch("2026-11-12T06:28:00Z"), 1794464880);
+        assert_eq!(epoch("2026-11-12T06:28:00"), 1794464880);
+        assert_eq!(epoch("2026-11-12 06:28"), 1794464880);
+        assert_eq!(epoch("2026-11-12T07:28:00+01:00"), 1794464880);
+        assert_eq!(epoch("2026-11-12T05:28:00-0100"), 1794464880);
+        assert_eq!(epoch("2026-11-12T06:28:00.900Z"), 1794464880);
+        assert_eq!(epoch("2024-02-29T00:00:00Z"), 1709164800);
+        for bad in ["2026-11-12", "2026-13-01T00:00", "yesterday", "2026-11-12T25:00", "2026-11-12T06:28+1"] {
+            assert!(parse_iso_time(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn before_time_and_mtime() {
+        let v: Value = serde_yaml::from_str("{time: '2026-11-12T06:28:00'}").unwrap();
+        assert_eq!(before_timestamp(Some(&v)).unwrap(), Some(parse_iso_time("2026-11-12T06:28:00Z").unwrap()));
+        // Unquoted YAML timestamps stay strings in serde_yaml.
+        let v: Value = serde_yaml::from_str("{time: 2026-11-12T06:28:00}").unwrap();
+        assert!(before_timestamp(Some(&v)).unwrap().is_some());
+        let f = std::env::temp_dir().join(format!("rmp-mtime-{}", std::process::id()));
+        std::fs::write(&f, b"").unwrap();
+        let v: Value = serde_yaml::from_str(&format!("{{mtime: '{}'}}", f.display())).unwrap();
+        assert_eq!(before_timestamp(Some(&v)).unwrap(), Some(std::fs::metadata(&f).unwrap().modified().unwrap()));
+        std::fs::remove_file(&f).unwrap();
+        let v: Value = serde_yaml::from_str("{hours: 2}").unwrap();
+        assert!(before_timestamp(Some(&v)).unwrap().unwrap() < SystemTime::now());
+    }
 }

@@ -435,6 +435,8 @@ impl Admin {
     fn build_conf(&self, req: &Json, mode: Mode) -> Result<(Yaml, Vec<String>, Json, String)> {
         let empty = Mapping::new();
         let seeds = self.seed_conf.get("seeds").and_then(|s| s.as_mapping()).unwrap_or(&empty);
+        // Sweeps: whole cache, remove_before = valid_after.
+        let cleanups = self.seed_conf.get("cleanups").and_then(|s| s.as_mapping()).unwrap_or(&empty);
         let coverages = self.seed_conf.get("coverages").and_then(|s| s.as_mapping()).unwrap_or(&empty);
         let seed_dir = self.opts.seed_conf.parent().unwrap_or(Path::new("."));
         let refresh = match mode {
@@ -446,7 +448,15 @@ impl Admin {
                 }
                 r => bail!("ukjent refresh {r:?}"),
             },
-            Mode::Cleanup => String::new(),
+            // all: whole area; default: the cache's valid_after.
+            Mode::Cleanup => match req["refresh"].as_str().unwrap_or("all") {
+                r @ ("all" | "default") => r.to_string(),
+                "older" => {
+                    let h = req["older_than_hours"].as_f64().filter(|h| *h > 0.0).ok_or_else(|| anyhow!("older_than_hours må være > 0"))?;
+                    format!("older:{h}")
+                }
+                r => bail!("ukjent sletteutvalg {r:?}"),
+            },
         };
         let refresh_value = |h: f64| -> Yaml {
             let mut m = Mapping::new();
@@ -454,7 +464,7 @@ impl Admin {
             Yaml::Mapping(m)
         };
         let cache_names: HashSet<&str> =
-            seeds.values().flat_map(|s| s.get("caches").and_then(|c| c.as_sequence()).into_iter().flatten()).filter_map(|c| c.as_str()).collect();
+            seeds.values().chain(cleanups.values()).flat_map(|s| s.get("caches").and_then(|c| c.as_sequence()).into_iter().flatten()).filter_map(|c| c.as_str()).collect();
         let first = seeds.values().next().cloned().unwrap_or(Yaml::Null);
 
         let mut entries = Mapping::new();
@@ -470,7 +480,10 @@ impl Admin {
             let lf = t["levels_from"].as_u64();
             let lt = t["levels_to"].as_u64();
             let mut nt = json!({ "name": name, "levels_from": lf, "levels_to": lt });
-            let mut entry = if let Some(e) = seeds.get(name.as_str()) {
+            let from_cleanups = mode == Mode::Cleanup && cleanups.contains_key(name.as_str());
+            let mut entry = if from_cleanups {
+                cleanups.get(name.as_str()).and_then(|e| e.as_mapping()).cloned().ok_or_else(|| anyhow!("{name}: ugyldig opprydding i seed.yaml"))?
+            } else if let Some(e) = seeds.get(name.as_str()) {
                 e.as_mapping().cloned().ok_or_else(|| anyhow!("{name}: ugyldig oppgave i seed.yaml"))?
             } else if let Some(b) = t["bbox"].as_array() {
                 let b: Vec<f64> = b.iter().filter_map(|v| v.as_f64()).collect();
@@ -520,17 +533,40 @@ impl Admin {
                 l.insert("to".into(), b.into());
                 entry.insert("levels".into(), Yaml::Mapping(l));
             }
-            match refresh.as_str() {
-                "default" => {}
-                "missing" => {
-                    entry.insert("refresh_before".into(), refresh_value(MISSING_DAYS as f64 * 24.0));
+            if mode == Mode::Cleanup {
+                // Cutoff = valid_after: the sweep's own, or the same-caches sweep's for an area
+                // task (its seed refresh_before is a rolling age).
+                let own = if from_cleanups {
+                    entry.remove("remove_before")
+                } else {
+                    cleanups.values().find(|c| c.get("caches") == entry.get("caches")).and_then(|c| c.get("remove_before")).cloned()
+                };
+                entry.remove("refresh_before");
+                entry.remove("remove_before");
+                let need_own = || own.clone().ok_or_else(|| anyhow!("{name}: har ingen tidsgrense i seed.yaml; velg «Alle» eller «Eldre enn»"));
+                let cut = match refresh.as_str() {
+                    r if r.starts_with("older:") => Some(refresh_value(r[6..].parse().unwrap_or(24.0))),
+                    "default" => Some(need_own()?),
+                    // No coverage: without a cutoff a sweep empties the cache.
+                    _ if from_cleanups => Some(need_own()?),
+                    _ => None,
+                };
+                if let Some(c) = cut {
+                    entry.insert("remove_before".into(), c);
                 }
-                r if r.starts_with("older:") => {
-                    entry.insert("refresh_before".into(), refresh_value(r[6..].parse().unwrap_or(24.0)));
-                }
-                _ => {
-                    // "all", and cleanups (remove everything in the task's area and levels).
-                    entry.remove("refresh_before");
+            } else {
+                match refresh.as_str() {
+                    "default" => {}
+                    "missing" => {
+                        entry.insert("refresh_before".into(), refresh_value(MISSING_DAYS as f64 * 24.0));
+                    }
+                    r if r.starts_with("older:") => {
+                        entry.insert("refresh_before".into(), refresh_value(r[6..].parse().unwrap_or(24.0)));
+                    }
+                    _ => {
+                        // all: re-render everything.
+                        entry.remove("refresh_before");
+                    }
                 }
             }
             for c in entry.get("coverages").and_then(|c| c.as_sequence()).into_iter().flatten().filter_map(|c| c.as_str()) {
@@ -1665,39 +1701,46 @@ fn task_list(mgr: &TileManager, conf: &Yaml, dir: &Path) -> Json {
         if p.is_absolute() { p } else { dir.join(p) }
     };
     let mut out = vec![];
-    for (name, s) in conf.get("seeds").and_then(|s| s.as_mapping()).into_iter().flatten() {
-        let Some(name) = name.as_str() else { continue };
-        let strs = |k: &str| -> Vec<String> {
-            s.get(k).and_then(|v| v.as_sequence()).into_iter().flatten().filter_map(|v| v.as_str().map(String::from)).collect()
-        };
-        let (caches, grids, covs) = (strs("caches"), strs("grids"), strs("coverages"));
-        let max = grids.first().and_then(|g| mgr.cfg.grids.get(g)).map_or(19, |g| g.res.len()) as u64;
-        let (lf, lt) = match s.get("levels") {
-            Some(Yaml::Mapping(m)) => (
-                m.get("from").and_then(|v| v.as_u64()).unwrap_or(0),
-                m.get("to").and_then(|v| v.as_u64()).unwrap_or(max - 1),
-            ),
-            Some(Yaml::Sequence(l)) => {
-                let l: Vec<u64> = l.iter().filter_map(|v| v.as_u64()).collect();
-                (l.iter().copied().min().unwrap_or(0), l.iter().copied().max().unwrap_or(max - 1))
-            }
-            _ => (0, max - 1),
-        };
-        let bbox = covs.first().and_then(|c| {
-            bboxes
-                .entry(c.clone())
-                .or_insert_with(|| {
-                    let conf = conf.get("coverages")?.get(c.as_str())?;
-                    let cov = crate::coverage::Coverage::from_conf(conf, &abspath).ok()?;
-                    let b = cov.srs.transform_bbox(wgs.as_ref()?, cov.bbox).ok()?;
-                    Some(b.map(|v| (v * 1e4).round() / 1e4))
-                })
-                .to_owned()
-        });
-        out.push(json!({
-            "name": name, "levels_from": lf, "levels_to": lt, "caches": caches, "grids": grids,
-            "bbox": bbox, "refresh_before": s.get("refresh_before").is_some(),
-        }));
+    for (kind, section, before_key) in [("seed", "seeds", "refresh_before"), ("cleanup", "cleanups", "remove_before")] {
+        for (name, s) in conf.get(section).and_then(|s| s.as_mapping()).into_iter().flatten() {
+            let Some(name) = name.as_str() else { continue };
+            let strs = |k: &str| -> Vec<String> {
+                s.get(k).and_then(|v| v.as_sequence()).into_iter().flatten().filter_map(|v| v.as_str().map(String::from)).collect()
+            };
+            let (caches, grids, covs) = (strs("caches"), strs("grids"), strs("coverages"));
+            let max = grids.first().and_then(|g| mgr.cfg.grids.get(g)).map_or(19, |g| g.res.len()) as u64;
+            let (lf, lt) = match s.get("levels") {
+                Some(Yaml::Mapping(m)) => (
+                    m.get("from").and_then(|v| v.as_u64()).unwrap_or(0),
+                    m.get("to").and_then(|v| v.as_u64()).unwrap_or(max - 1),
+                ),
+                Some(Yaml::Sequence(l)) => {
+                    let l: Vec<u64> = l.iter().filter_map(|v| v.as_u64()).collect();
+                    (l.iter().copied().min().unwrap_or(0), l.iter().copied().max().unwrap_or(max - 1))
+                }
+                _ => (0, max - 1),
+            };
+            let bbox = covs.first().and_then(|c| {
+                bboxes
+                    .entry(c.clone())
+                    .or_insert_with(|| {
+                        let conf = conf.get("coverages")?.get(c.as_str())?;
+                        let cov = crate::coverage::Coverage::from_conf(conf, &abspath).ok()?;
+                        let b = cov.srs.transform_bbox(wgs.as_ref()?, cov.bbox).ok()?;
+                        Some(b.map(|v| (v * 1e4).round() / 1e4))
+                    })
+                    .to_owned()
+            });
+            // time cutoffs as is, relative ones as their mapping.
+            let cutoff = s.get(before_key).map(|b| match b.get("time").and_then(|t| t.as_str()) {
+                Some(t) => json!(t),
+                None => serde_json::to_value(b).unwrap_or(Json::Null),
+            });
+            out.push(json!({
+                "name": name, "kind": kind, "levels_from": lf, "levels_to": lt, "caches": caches, "grids": grids,
+                "bbox": bbox, "refresh_before": s.get("refresh_before").is_some(), "cutoff": cutoff,
+            }));
+        }
     }
     json!({ "tasks": out })
 }
