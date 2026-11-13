@@ -8,6 +8,7 @@ mod coverage;
 mod e2e_tests;
 mod grid;
 mod image;
+mod legend;
 mod metrics;
 mod pickle;
 mod pyfloat;

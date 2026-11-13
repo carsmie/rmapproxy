@@ -83,11 +83,21 @@ pub async fn shutdown_signal() {
 /// tnt-mapproxy's `/legend/topo-<scale>.png`: files the admin app writes to
 /// MAPPROXY_LEGEND_DIR (default `<cache base_dir>/legend`).
 async fn legend(State(app): State<App>, Path(file): Path<String>) -> Response {
-    let ok = file.strip_prefix("topo-").and_then(|f| f.strip_suffix(".png")).is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+    // topo-<scale>.png, topo-<scale>@2x.png, topo-<scale>.json only (no path components).
+    let kind = file.strip_prefix("topo-").and_then(|f| {
+        let (n, ct) = if let Some(n) = f.strip_suffix("@2x.png") {
+            (n, "image/png")
+        } else if let Some(n) = f.strip_suffix(".png") {
+            (n, "image/png")
+        } else {
+            (f.strip_suffix(".json")?, "application/json")
+        };
+        (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())).then_some(ct)
+    });
     let dir = std::env::var_os("MAPPROXY_LEGEND_DIR").map(std::path::PathBuf::from).unwrap_or_else(|| app.mgr.cfg.globals.base_dir.join("legend"));
-    match ok.then(|| std::fs::read(dir.join(&file))) {
-        Some(Ok(data)) => (
-            [(header::CONTENT_TYPE, "image/png"), (header::CACHE_CONTROL, "public, max-age=3600")],
+    match kind.map(|ct| (ct, std::fs::read(dir.join(&file)))) {
+        Some((ct, Ok(data))) => (
+            [(header::CONTENT_TYPE, ct), (header::CACHE_CONTROL, "public, max-age=3600")],
             data,
         )
             .into_response(),

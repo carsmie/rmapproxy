@@ -1321,38 +1321,59 @@ impl Admin {
         }
         std::fs::create_dir_all(&self.legend_dir)?;
         let client = reqwest::Client::builder().timeout(Duration::from_secs(30)).build()?;
+        // Labels need a font; without one the legend is symbols only (as before).
+        let font = std::env::var_os("RMAPPROXY_LEGEND_FONT").map(PathBuf::from).unwrap_or_else(|| "/usr/share/fonts/noto/NotoSans-Regular.ttf".into());
+        let text = crate::legend::Text::load(&font).map_err(|e| warn!("legend font: {e}; symbols only")).ok();
         let (mut made, mut failed) = (vec![], vec![]);
         for scale in LEGEND_SCALES {
             let out = self.legend_dir.join(format!("topo-{scale}.png"));
             if out.exists() && !force {
                 continue;
             }
-            let fetches = sources.iter().map(|(url, layers)| {
-                let sep = if url.contains('?') { '&' } else { '?' };
-                let u = format!(
-                    "{url}{sep}SERVICE=WMS&REQUEST=GetLegendGraphic&VERSION=1.3.0&SLD_VERSION=1.1.0&FORMAT=image%2Fpng\
-                     &STYLE=default&LAYERTITLE=false&LAYER={}&SCALE={scale}",
-                    url_escape(layers)
-                );
-                let c = client.clone();
-                async move {
-                    let r = async { c.get(&u).send().await?.error_for_status()?.bytes().await }.await;
-                    match r {
-                        Ok(b) if b.len() >= 100 => crate::image::decode_png(&b).ok().map(|(img, _)| img),
-                        Ok(_) => None,
-                        Err(e) => {
-                            warn!("legend {layers} at 1:{scale}: {e}");
-                            None
+            // Each source's JSON legend at 96, 192, 384 dpi: ×1 / ×2 output, ×4 for tiny symbols.
+            let fetches = sources.iter().flat_map(|(url, layers)| {
+                [1u32, 2, 4].map(|k| {
+                    let sep = if url.contains('?') { '&' } else { '?' };
+                    let u = format!(
+                        "{url}{sep}SERVICE=WMS&REQUEST=GetLegendGraphic&VERSION=1.3.0&SLD_VERSION=1.1.0&FORMAT=application%2Fjson\
+                         &STYLE=default&LAYERTITLE=false&DPI={}&LAYER={}&SCALE={scale}",
+                        96 * k,
+                        url_escape(layers)
+                    );
+                    let c = client.clone();
+                    async move {
+                        let r = async { anyhow::Ok(serde_json::from_slice::<Json>(&c.get(&u).send().await?.error_for_status()?.bytes().await?)?) }.await;
+                        match r {
+                            Ok(v) => Some(crate::legend::json_rows(&v)),
+                            Err(e) => {
+                                warn!("legend {layers} at 1:{scale} ×{k}: {e}");
+                                None
+                            }
                         }
                     }
-                }
+                })
             });
-            let imgs: Vec<crate::image::Rgba> = futures::future::join_all(fetches).await.into_iter().flatten().collect();
-            if imgs.is_empty() {
+            let res: Vec<Option<Vec<(String, Option<crate::image::Rgba>)>>> = futures::future::join_all(fetches).await;
+            let mut raw = vec![];
+            for per_src in res.chunks(3) {
+                let [Some(r1), r2, r4] = per_src else { continue };
+                // ×2/×4 rows line up with ×1 when the source answered all three alike.
+                let pick = |r: &Option<Vec<(String, Option<crate::image::Rgba>)>>, i: usize| r.as_ref().filter(|r| r.len() == r1.len()).and_then(|r| r[i].1.clone());
+                for (i, (label, icon)) in r1.iter().enumerate() {
+                    raw.push(crate::legend::RawItem { label: label.clone(), icons: [icon.clone(), pick(r2, i), pick(r4, i)] });
+                }
+            }
+            let items = crate::legend::build(raw);
+            if items.is_empty() {
                 failed.push(scale);
                 continue;
             }
-            let png = crate::image::encode_png_rgba(&stack_on_white(&imgs), png::Compression::Balanced)?;
+            let png2 = crate::image::encode_png_rgba(&crate::legend::render(&items, 2, text.as_ref()), png::Compression::Balanced)?;
+            write_atomic(&self.legend_dir.join(format!("topo-{scale}@2x.png")), &png2)?;
+            let json = crate::legend::to_json(&items, scale)?;
+            write_atomic(&self.legend_dir.join(format!("topo-{scale}.json")), serde_json::to_vec(&json)?.as_slice())?;
+            // ×1 PNG last: its existence marks the scale done (skipped unless forced).
+            let png = crate::image::encode_png_rgba(&crate::legend::render(&items, 1, text.as_ref()), png::Compression::Balanced)?;
             write_atomic(&out, &png)?;
             made.push(scale);
         }
@@ -1484,29 +1505,6 @@ fn url_escape(s: &str) -> String {
         } else {
             out.push_str(&format!("%{b:02X}"));
         }
-    }
-    out
-}
-
-/// Legends one below the other on white, each blended by its alpha (tnt-mapproxy's
-/// `_stack_pngs`, made opaque).
-fn stack_on_white(imgs: &[crate::image::Rgba]) -> crate::image::Rgba {
-    let w = imgs.iter().map(|i| i.w).max().unwrap_or(1);
-    let h: u32 = imgs.iter().map(|i| i.h).sum();
-    let mut out = crate::image::Rgba::filled(w, h.max(1), [255, 255, 255, 255]);
-    let mut y0 = 0usize;
-    for img in imgs {
-        for y in 0..img.h as usize {
-            for x in 0..img.w as usize {
-                let s = &img.px[(y * img.w as usize + x) * 4..][..4];
-                let d = &mut out.px[((y0 + y) * w as usize + x) * 4..][..4];
-                let a = s[3] as u32;
-                for c in 0..3 {
-                    d[c] = ((s[c] as u32 * a + d[c] as u32 * (255 - a) + 127) / 255) as u8;
-                }
-            }
-        }
-        y0 += img.h as usize;
     }
     out
 }
@@ -1998,13 +1996,4 @@ mod tests {
         assert!(cross_site(&h(&[("origin", "https://evil.example"), ("host", "topo.example")])));
     }
 
-    #[test]
-    fn legend_stack_blends_on_white() {
-        let a = crate::image::Rgba::filled(2, 1, [0, 0, 0, 255]);
-        let b = crate::image::Rgba::filled(1, 2, [0, 0, 0, 0]);
-        let s = stack_on_white(&[a, b]);
-        assert_eq!((s.w, s.h), (2, 3));
-        assert_eq!(&s.px[0..4], &[0, 0, 0, 255]);
-        assert_eq!(&s.px[8..12], &[255, 255, 255, 255]);
-    }
 }

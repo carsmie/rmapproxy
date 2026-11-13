@@ -10,7 +10,8 @@ COPY src src
 RUN touch src/main.rs && cargo build --release --locked && strip target/release/rmapproxy
 
 FROM alpine:3.24
-RUN apk upgrade --no-cache && adduser -D -u 150 mapproxy
+# font-noto: legend labels (RMAPPROXY_LEGEND_FONT default).
+RUN apk upgrade --no-cache && apk add --no-cache font-noto && adduser -D -u 150 mapproxy
 COPY --from=build /src/target/release/rmapproxy /usr/local/bin/rmapproxy
 # Installed under mapproxy-seed's name too: tnt-mapproxy's admin app and seed jobs run that
 # command and recognise seed processes by it.
