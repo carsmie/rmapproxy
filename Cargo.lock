@@ -874,9 +874,9 @@ dependencies = [
 
 [[package]]
 name = "proj4rs"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c237a4e4da4e0f2eae7a5d078df926894ccf1b315043dbccebc413888487d562"
+checksum = "b1ee6afb8b75ae1ca17036298626d981dff6ba14278ccf0c6cf3bbb473228177"
 dependencies = [
  "console_log",
  "js-sys",
@@ -982,9 +982,9 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rand"
-version = "0.10.3"
+version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "65c9fb96cbc91e3478eaae79a69fcd3f1ae4ad052e471fe6732fff548984b4af"
+checksum = "8f6fa277c67e6ea590466f04c3fe82cb509f0864fe470643e5570de9514a9b11"
 dependencies = [
  "chacha20",
  "getrandom 0.4.3",
