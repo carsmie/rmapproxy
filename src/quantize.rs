@@ -533,9 +533,7 @@ pub fn mediancut(pixels: &[Px], colors: u32) -> (Vec<Px>, Vec<u8>) {
         let idx = lists.n.len() as u32;
         lists.n.push(PixelList { next: [head; 3], prev: [NIL; 3], p: key.map(|v| v >> scale), flag: false, count });
         if head != NIL {
-            for i in 0..3 {
-                lists.n[head as usize].prev[i] = idx;
-            }
+            lists.n[head as usize].prev = [idx; 3];
         }
         head = idx;
     }

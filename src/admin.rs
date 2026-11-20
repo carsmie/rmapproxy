@@ -32,6 +32,9 @@ use crate::seed::{self, Mode};
 use crate::tile::TileManager;
 use crate::work::Queue;
 
+/// One source's GetLegendGraphic JSON rows: label and icon.
+type LegendRows = Vec<(String, Option<crate::image::Rgba>)>;
+
 const LOG_MAX: usize = 400;
 const LOG_LINE_MAX: usize = 2000;
 /// Running, but no output for this long (rmapproxy seed prints progress every 30 s).
@@ -1354,12 +1357,12 @@ impl Admin {
                     }
                 })
             });
-            let res: Vec<Option<Vec<(String, Option<crate::image::Rgba>)>>> = futures::future::join_all(fetches).await;
+            let res: Vec<Option<LegendRows>> = futures::future::join_all(fetches).await;
             let mut raw = vec![];
             for per_src in res.chunks(3) {
                 let [Some(r1), r2, r4] = per_src else { continue };
                 // ×2/×4 rows line up with ×1 when the source answered all three alike.
-                let pick = |r: &Option<Vec<(String, Option<crate::image::Rgba>)>>, i: usize| r.as_ref().filter(|r| r.len() == r1.len()).and_then(|r| r[i].1.clone());
+                let pick = |r: &Option<LegendRows>, i: usize| r.as_ref().filter(|r| r.len() == r1.len()).and_then(|r| r[i].1.clone());
                 for (i, (label, icon)) in r1.iter().enumerate() {
                     raw.push(crate::legend::RawItem { label: label.clone(), icons: [icon.clone(), pick(r2, i), pick(r4, i)] });
                 }
