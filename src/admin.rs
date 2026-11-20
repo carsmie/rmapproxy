@@ -1369,12 +1369,12 @@ impl Admin {
                 failed.push(scale);
                 continue;
             }
-            let png2 = crate::image::encode_png_rgba(&crate::legend::render(&items, 2, text.as_ref()), png::Compression::Balanced)?;
+            let png2 = crate::image::encode_png_rgba(&crate::legend::render(&items, 2, text.as_ref()), crate::image::PNG_BALANCED)?;
             write_atomic(&self.legend_dir.join(format!("topo-{scale}@2x.png")), &png2)?;
             let json = crate::legend::to_json(&items, scale)?;
             write_atomic(&self.legend_dir.join(format!("topo-{scale}.json")), serde_json::to_vec(&json)?.as_slice())?;
             // ×1 PNG last: its existence marks the scale done (skipped unless forced).
-            let png = crate::image::encode_png_rgba(&crate::legend::render(&items, 1, text.as_ref()), png::Compression::Balanced)?;
+            let png = crate::image::encode_png_rgba(&crate::legend::render(&items, 1, text.as_ref()), crate::image::PNG_BALANCED)?;
             write_atomic(&out, &png)?;
             made.push(scale);
         }

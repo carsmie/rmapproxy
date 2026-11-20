@@ -518,7 +518,7 @@ fn encode(img: Img, format: &str, transparent: bool) -> Result<(&'static str, Ve
     let img = img.pixels()?;
     if png {
         if transparent {
-            return Ok(("image/png", encode_png_rgba(&img, png::Compression::Fast)?));
+            return Ok(("image/png", encode_png_rgba(&img, crate::image::PNG_FAST)?));
         }
         let rgb: Vec<u8> = img.px.as_chunks::<4>().0.iter().flat_map(|p| [p[0], p[1], p[2]]).collect();
         let mut out = vec![];

@@ -314,7 +314,7 @@ pub fn to_json(items: &[Item], scale: u32) -> anyhow::Result<Json> {
     let mut rows = vec![];
     for it in items {
         let i2 = &it.icons[1];
-        let png = crate::image::encode_png_rgba(i2, png::Compression::Balanced)?;
+        let png = crate::image::encode_png_rgba(i2, crate::image::PNG_BALANCED)?;
         rows.push(json!({
             "label": it.label(),
             "names": it.names,
@@ -458,7 +458,7 @@ mod tests {
         for (k, f) in [(1, format!("topo-{scale}.png")), (2, format!("topo-{scale}@2x.png"))] {
             let img = render(&items, k, Some(&text));
             eprintln!("{f}: {}x{}", img.w, img.h);
-            std::fs::write(out.join(f), crate::image::encode_png_rgba(&img, png::Compression::Balanced).unwrap()).unwrap();
+            std::fs::write(out.join(f), crate::image::encode_png_rgba(&img, crate::image::PNG_BALANCED).unwrap()).unwrap();
         }
         std::fs::write(out.join(format!("topo-{scale}.json")), serde_json::to_vec_pretty(&to_json(&items, scale).unwrap()).unwrap()).unwrap();
     }

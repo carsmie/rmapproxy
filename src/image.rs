@@ -165,14 +165,109 @@ pub fn decode_png_typed(data: &[u8]) -> Result<(Rgba, MergeMode, png::ColorType)
     Ok((Rgba { w, h, px }, mode, ctype))
 }
 
+/// zlib level 6, what png::Compression::Balanced maps to (flate2's default level).
+pub const PNG_BALANCED: png::DeflateCompression = png::DeflateCompression::Level(6);
+/// fdeflate, png::Compression::Fast.
+pub const PNG_FAST: png::DeflateCompression = png::DeflateCompression::FdeflateUltraFast;
+/// Cached tiles: zlib 4 is as small as 6 (RGBA +0.2 %, paletted ±0) at 40-60 % less time (Oslo
+/// z12/z15: 16 RGBA tiles 81 → 49 ms, 4 paletted 512² 55 → 22 ms). Level 2 halves it again but
+/// adds 2-3 % bytes; fdeflate adds ~35 % (cache volumes are tight, so size stays).
+pub const PNG_TILE: png::DeflateCompression = png::DeflateCompression::Level(4);
+
+/// `decode_png` of a `size` image, then merged into `canvas` as `Merger` would: placed at
+/// `place` (a coverage sub-image: pasted into a blank canvas, then composited = composite at the
+/// offset), else by its MergeMode at 0,0. Row by row, so no image-sized buffer per source (6 MB
+/// at 1224²; the alloc/free churn was 25-40 % of seed CPU as system time, musl worst).
+pub fn merge_png_into(canvas: &mut Rgba, data: &[u8], size: (u32, u32), place: Option<(i64, i64)>) -> Result<()> {
+    let mut dec = png::Decoder::new(std::io::Cursor::new(data));
+    dec.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = dec.read_info().map_err(|e| anyhow!("png: {e}"))?;
+    let info = reader.info();
+    if (info.width, info.height) != size {
+        bail!("got {}x{}, asked {}x{}", info.width, info.height, size.0, size.1);
+    }
+    let interlaced = info.interlaced;
+    let mode = match (place, info.color_type) {
+        (Some(_), _) | (None, png::ColorType::Rgba | png::ColorType::Indexed) => MergeMode::Composite,
+        _ if info.trns.is_some() => MergeMode::Composite,
+        _ => MergeMode::Paste,
+    };
+    let (x, y) = place.unwrap_or((0, 0));
+    if interlaced {
+        // Adam7 rows arrive per pass: decode whole (rGIS/QGIS don't interlace).
+        let (img, _) = decode_png(data)?;
+        for (sy, row) in img.px.chunks_exact(img.w as usize * 4).enumerate() {
+            merge_row(canvas, row, x, y + sy as i64, mode);
+        }
+        return Ok(());
+    }
+    let ctype = reader.output_color_type().0;
+    let mut rgba = Vec::with_capacity(size.0 as usize * 4);
+    let mut sy = 0i64;
+    while let Some(row) = reader.next_row().map_err(|e| anyhow!("png: {e}"))? {
+        let src = row.data();
+        let px: &[u8] = match ctype {
+            png::ColorType::Rgba => src,
+            png::ColorType::Rgb => {
+                rgba.clear();
+                rgba.extend(src.as_chunks::<3>().0.iter().flat_map(|p| [p[0], p[1], p[2], 255]));
+                &rgba
+            }
+            png::ColorType::Grayscale => {
+                rgba.clear();
+                rgba.extend(src.iter().flat_map(|&g| [g, g, g, 255]));
+                &rgba
+            }
+            png::ColorType::GrayscaleAlpha => {
+                rgba.clear();
+                rgba.extend(src.as_chunks::<2>().0.iter().flat_map(|p| [p[0], p[0], p[0], p[1]]));
+                &rgba
+            }
+            png::ColorType::Indexed => bail!("png: palette not expanded"),
+        };
+        if px.len() != size.0 as usize * 4 {
+            bail!("png: unexpected row size");
+        }
+        merge_row(canvas, px, x, y + sy, mode);
+        sy += 1;
+    }
+    if sy != size.1 as i64 {
+        bail!("png: {sy} of {} rows", size.1);
+    }
+    Ok(())
+}
+
+/// One source row (RGBA) at canvas (x, y): composited or pasted, clipped like `paste`.
+fn merge_row(canvas: &mut Rgba, row: &[u8], x: i64, y: i64, mode: MergeMode) {
+    if y < 0 || y >= canvas.h as i64 {
+        return;
+    }
+    let w = (row.len() / 4) as i64;
+    let (x0, x1) = (x.max(0), (x + w).min(canvas.w as i64));
+    if x0 >= x1 {
+        return;
+    }
+    let s = &row[((x0 - x) * 4) as usize..((x1 - x) * 4) as usize];
+    let d0 = ((y * canvas.w as i64 + x0) * 4) as usize;
+    let d = &mut canvas.px[d0..d0 + s.len()];
+    match mode {
+        MergeMode::Paste => d.copy_from_slice(s),
+        MergeMode::Composite => {
+            for (d, s) in d.as_chunks_mut::<4>().0.iter_mut().zip(s.as_chunks::<4>().0) {
+                composite_px(d, s);
+            }
+        }
+    }
+}
+
 /// RGBA PNG (MapProxy's default for transparent png caches without `colors`).
-pub fn encode_png_rgba(img: &Rgba, compression: png::Compression) -> Result<Vec<u8>> {
+pub fn encode_png_rgba(img: &Rgba, compression: png::DeflateCompression) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(img.px.len() / 4);
     {
         let mut enc = png::Encoder::new(&mut out, img.w, img.h);
         enc.set_color(png::ColorType::Rgba);
         enc.set_depth(png::BitDepth::Eight);
-        enc.set_compression(compression);
+        enc.set_deflate_compression(compression);
         let mut w = enc.write_header()?;
         w.write_image_data(&img.px)?;
     }
@@ -182,7 +277,7 @@ pub fn encode_png_rgba(img: &Rgba, compression: png::Compression) -> Result<Vec<
 /// Paletted PNG as Pillow's PngImagePlugin writes a P image with `transparency=255`:
 /// bit depth from the palette size, PLTE = palette, tRNS = (ff * 255 + 00)[:colors],
 /// indices packed to the bit depth (so index 255 keeps only its low bits).
-pub fn encode_png_paletted(w: u32, h: u32, palette: &[[u8; 3]], idx: &[u8], transparency: bool, compression: png::Compression) -> Result<Vec<u8>> {
+pub fn encode_png_paletted(w: u32, h: u32, palette: &[[u8; 3]], idx: &[u8], transparency: bool, compression: png::DeflateCompression) -> Result<Vec<u8>> {
     let colors = palette.len().clamp(1, 256);
     let bits: u8 = match colors {
         0..=2 => 1,
@@ -209,7 +304,7 @@ pub fn encode_png_paletted(w: u32, h: u32, palette: &[[u8; 3]], idx: &[u8], tran
             trns.truncate(colors);
             enc.set_trns(trns);
         }
-        enc.set_compression(compression);
+        enc.set_deflate_compression(compression);
         let mut wr = enc.write_header()?;
         if bits == 8 {
             wr.write_image_data(idx)?;
@@ -252,12 +347,12 @@ const SPOT_MAX: usize = 32;
 /// motorway core 255,255,0 → 248,243,134; Svinesund 2x tiles 2026-11-11). Bins, not exact colours:
 /// thin lines are mostly anti-aliased shades. No such bins → output identical to `mediancut`.
 pub fn quantize_mediancut_spot_alpha(img: &Rgba, colors: u32) -> (Vec<[u8; 3]>, Vec<u8>) {
-    use std::collections::HashMap;
+    use rustc_hash::FxHashMap as HashMap; // order-independent: sums, max, fully tie-broken sort
     let rgb = rgb_of(img);
     let (pal, idx) = crate::quantize::mediancut(&rgb, colors - 1);
     let opaque = |i: usize| img.px[i * 4 + 3] > 128;
     // Exact-colour histogram of opaque pixels, with median cut's entry for that colour.
-    let mut hist: HashMap<[u8; 3], (u32, u8)> = HashMap::new();
+    let mut hist: HashMap<[u8; 3], (u32, u8)> = HashMap::default();
     for (i, &c) in rgb.iter().enumerate() {
         if opaque(i) {
             hist.entry(c).or_insert((0, idx[i])).0 += 1;
@@ -265,7 +360,7 @@ pub fn quantize_mediancut_spot_alpha(img: &Rgba, colors: u32) -> (Vec<[u8; 3]>, 
     }
     // Per bin: pixels, summed squared error, most common exact colour (count, colour).
     type Bin = (u32, u64, (u32, [u8; 3]));
-    let mut bins: HashMap<[u8; 3], Bin> = HashMap::new();
+    let mut bins: HashMap<[u8; 3], Bin> = HashMap::default();
     for (&c, &(n, e)) in &hist {
         let b = bins.entry([c[0] >> 5, c[1] >> 5, c[2] >> 5]).or_insert((0, 0, (0, c)));
         b.0 += n;
@@ -296,7 +391,7 @@ pub fn quantize_mediancut_spot_alpha(img: &Rgba, colors: u32) -> (Vec<[u8; 3]>, 
     let (mut pal, mut idx) = crate::quantize::mediancut(&rgb, colors - 1 - spots.len() as u32);
     let base = pal.len();
     pal.extend_from_slice(&spots);
-    let mut memo: HashMap<([u8; 3], u8), u8> = HashMap::new();
+    let mut memo: HashMap<([u8; 3], u8), u8> = HashMap::default();
     for (i, &c) in rgb.iter().enumerate() {
         let cur = idx[i];
         idx[i] = *memo.entry((c, cur)).or_insert_with(|| {
@@ -344,6 +439,66 @@ fn apply_alpha(img: &Rgba, mut pal: Vec<[u8; 3]>, mut idx: Vec<u8>) -> (Vec<[u8;
 mod tests {
     use super::*;
 
+    /// Streaming merge = decode_png + Merger's paste/composite, for every colour type and offset.
+    #[test]
+    fn merge_png_into_matches_decode_then_merge() {
+        let (w, h) = (37u32, 23u32);
+        let px = |i: usize, c: usize| ((i * 31 + c * 77) % 256) as u8;
+        let enc = |ct: png::ColorType, ch: usize, trns: Option<Vec<u8>>| {
+            let data: Vec<u8> = (0..(w * h) as usize).flat_map(|i| (0..ch).map(move |c| if ch == 4 && c == 3 && i % 5 == 0 { 0 } else { px(i, c) })).collect();
+            let mut out = Vec::new();
+            {
+                let mut e = png::Encoder::new(&mut out, w, h);
+                e.set_color(ct);
+                e.set_depth(png::BitDepth::Eight);
+                if let Some(t) = trns {
+                    e.set_trns(t);
+                }
+                let mut wr = e.write_header().unwrap();
+                wr.write_image_data(&data).unwrap();
+            }
+            out
+        };
+        let pngs = [
+            enc(png::ColorType::Rgba, 4, None),
+            enc(png::ColorType::Rgb, 3, None),
+            enc(png::ColorType::Rgb, 3, Some(vec![0, px(0, 1), 0, px(0, 2), 0, 0])),
+            enc(png::ColorType::GrayscaleAlpha, 2, None),
+            enc(png::ColorType::Grayscale, 1, None),
+        ];
+        let base = || {
+            let mut c = Rgba::blank(40, 30);
+            for (i, p) in c.px.chunks_mut(4).enumerate() {
+                p.copy_from_slice(&[px(i, 2), px(i, 0), px(i, 1), (i * 13 % 256) as u8]);
+            }
+            c
+        };
+        for data in &pngs {
+            for place in [None, Some((5, 4)), Some((-3, -2)), Some((20, 15))] {
+                let mut want = base();
+                let (img, mode) = decode_png(data).unwrap();
+                match place {
+                    // SourceImage::decode: pasted into a blank metatile canvas, then composited.
+                    Some((x, y)) => {
+                        let mut sub = Rgba::blank(40, 30);
+                        sub.paste(&img, x, y);
+                        want.alpha_composite(&sub);
+                    }
+                    None if mode == MergeMode::Paste => want.paste(&img, 0, 0),
+                    None => {
+                        let mut full = Rgba::blank(40, 30);
+                        full.paste(&img, 0, 0);
+                        want.alpha_composite(&full);
+                    }
+                }
+                let mut got = base();
+                merge_png_into(&mut got, data, (w, h), place).unwrap();
+                assert!(got.px == want.px, "{mode:?} {place:?}");
+            }
+        }
+        assert!(merge_png_into(&mut base(), &pngs[0], (w + 1, h), None).is_err());
+    }
+
     /// Fixture from Pillow: src = every (src_a, dst_a) pair with varying colours,
     /// expected = Image.alpha_composite(dst, src) (see tests/fixtures/README).
     #[test]
@@ -365,7 +520,7 @@ mod tests {
         }
         let (pal, idx) = quantize_mediancut_alpha(&img, 256);
         assert_eq!(pal.len(), 256);
-        let png = encode_png_paletted(4, 4, &pal, &idx, true, png::Compression::Fast).unwrap();
+        let png = encode_png_paletted(4, 4, &pal, &idx, true, PNG_FAST).unwrap();
         let (out, _) = decode_png(&png).unwrap();
         assert!(out.px.chunks(4).skip(8).all(|p| p[3] == 0), "transparent half not transparent");
         assert!(out.px.chunks(4).take(8).all(|p| p[3] == 255));
@@ -444,7 +599,7 @@ mod tests {
                         }
                     }
                 }
-                let kb = encode_png_paletted(img.w, img.h, &pal, &idx, true, png::Compression::Balanced).unwrap().len() / 1024;
+                let kb = encode_png_paletted(img.w, img.h, &pal, &idx, true, PNG_BALANCED).unwrap().len() / 1024;
                 let psnr = 10.0 * (255.0f64 * 255.0 / (se / n)).log10();
                 let w: Vec<String> = style.iter().zip(near).map(|((s, _), (e, n))| format!("{s}={:.1}/{n}", e / n.max(1) as f64)).collect();
                 println!("{} {name:9} psnr {psnr:.2} dB {ms:.0} ms {kb} KiB pal {} mean-err near {}", f.file_name().unwrap().to_string_lossy(), pal.len(), w.join(" "));

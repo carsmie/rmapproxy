@@ -41,7 +41,7 @@ async fn getmap(State(f): State<Arc<FakeWms>>, Query(q): Query<HashMap<String, S
     f.inflight.fetch_sub(1, Ordering::SeqCst);
     let dim = |k: &str| q.get(k).and_then(|v| v.parse().ok()).unwrap_or(1);
     let img = Rgba::filled(dim("width"), dim("height"), [16, 128, 240, 255]);
-    ([(header::CONTENT_TYPE, "image/png")], encode_png_rgba(&img, png::Compression::Balanced).unwrap()).into_response()
+    ([(header::CONTENT_TYPE, "image/png")], encode_png_rgba(&img, crate::image::PNG_BALANCED).unwrap()).into_response()
 }
 
 /// Serve `router` on an ephemeral port; returns its base URL.

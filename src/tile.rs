@@ -226,12 +226,8 @@ impl TileManager {
                 SourceImage::Decoded(img, mode) => merger.add(img, mode),
                 SourceImage::Png { data, size: sub, place } => {
                     // Decode + composite on this worker without stalling the runtime.
-                    tokio::task::block_in_place(|| -> Result<()> {
-                        let (img, mode) = SourceImage::decode(&data, sub, place, size)
-                            .with_context(|| format!("source {}", s.conf.name))?;
-                        merger.add(img, mode);
-                        Ok(())
-                    })?;
+                    tokio::task::block_in_place(|| merger.add_png(&data, sub, place))
+                        .with_context(|| format!("source {}", s.conf.name))?;
                 }
             }
         }
@@ -332,6 +328,22 @@ impl Merger {
         }
     }
 
+    /// `add` of an encoded source: from the second layer on it is decoded straight into the
+    /// canvas (`merge_png_into`); the first stays whole for the single-layer shortcut.
+    fn add_png(&mut self, data: &[u8], size: (u32, u32), place: Option<(i64, i64)>) -> Result<()> {
+        if self.canvas.is_none() {
+            let Some((f, fm)) = self.first.take() else {
+                let (img, mode) = SourceImage::decode(data, size, place, self.size)?;
+                self.first = Some((img, mode));
+                return Ok(());
+            };
+            let mut c = Rgba::blank(self.size.0, self.size.1);
+            Self::apply(&mut c, &f, fm);
+            self.canvas = Some(c);
+        }
+        crate::image::merge_png_into(self.canvas.as_mut().expect("canvas"), data, size, place)
+    }
+
     fn finish(self) -> Rgba {
         match (self.canvas, self.first) {
             (Some(c), _) => c,
@@ -357,11 +369,11 @@ fn encode(img: &Rgba, opts: &ImageOpts) -> Result<Vec<u8>> {
         };
         if let Some(q) = quant {
             let (pal, idx) = q(img, colors);
-            return crate::image::encode_png_paletted(img.w, img.h, &pal, &idx, true, png::Compression::Balanced);
+            return crate::image::encode_png_paletted(img.w, img.h, &pal, &idx, true, crate::image::PNG_TILE);
         }
         // TODO(parity): Pillow's fastoctree (the default quantizer).
         static WARNED: std::sync::Once = std::sync::Once::new();
         WARNED.call_once(|| warn!("image.colors with the fastoctree quantizer is not implemented; writing RGBA"));
     }
-    encode_png_rgba(img, png::Compression::Balanced)
+    encode_png_rgba(img, crate::image::PNG_TILE)
 }

@@ -1103,6 +1103,7 @@ dependencies = [
  "prometheus",
  "rand",
  "reqwest",
+ "rustc-hash",
  "serde_json",
  "serde_yaml",
  "tokio",

@@ -3,7 +3,9 @@
 //! split, so it is exact (including `_findPrime`'s `!start % t` quirk). Plus MapProxy's use of it
 //! (`image/__init__.py::quantize`, quantizer=mediancut, alpha=True).
 
-use std::collections::HashMap;
+// FxHash: per-pixel memo lookups; SipHash cost ~30 % of a 2x quantize. Maps are never
+// iterated in an order that reaches the output, so Pillow parity is unaffected.
+use rustc_hash::FxHashMap as HashMap;
 
 const MAX_HASH_ENTRIES: u32 = 65536;
 const MIN_LENGTH: u32 = 11;
@@ -549,7 +551,7 @@ pub fn mediancut(pixels: &[Px], colors: u32) -> (Vec<Px>, Vec<u8>) {
     // compute_palette_from_median_cut
     let n = n_entries as usize;
     let (mut avg, mut count) = (vec![[0u32; 3]; n], vec![0u32; n]);
-    let mut box_of: HashMap<Px, u32> = HashMap::new();
+    let mut box_of: HashMap<Px, u32> = HashMap::default();
     for &p in pixels {
         let e = *box_of.entry(p).or_insert_with(|| h.lookup(p).expect("pixel in median-cut hash"));
         for c in 0..3 {
@@ -580,7 +582,7 @@ pub fn mediancut(pixels: &[Px], colors: u32) -> (Vec<Px>, Vec<u8>) {
     }
 
     // map_image_pixels_from_median_box
-    let mut cache: HashMap<Px, u8> = HashMap::new();
+    let mut cache: HashMap<Px, u8> = HashMap::default();
     let indices = pixels
         .iter()
         .map(|&p| {
