@@ -156,6 +156,9 @@ async fn cors(req: axum::extract::Request, next: axum::middleware::Next) -> Resp
     resp
 }
 
+/// Client text for internal failures; the details are logged.
+pub(crate) const INTERNAL_ERROR: &str = "Internal error, see the server log";
+
 fn ows_error(status: StatusCode, code: &str, text: &str) -> Response {
     let body = format!(
         "<?xml version=\"1.0\"?>\n<ExceptionReport xmlns=\"http://www.opengis.net/ows/1.1\" version=\"1.1.0\">\n  \
@@ -260,8 +263,9 @@ async fn tile(app: &App, layer: &str, set: &str, z: &str, row: &str, col: &str) 
             r
         }
         Err(e) => {
+            // Backend URLs, cache paths and upstream bodies go to the log, not to clients.
             warn!("{layer}/{set}/{z}/{row}/{col}: {e:#}");
-            ows_error(StatusCode::INTERNAL_SERVER_ERROR, "NoApplicableCode", &format!("{e:#}"))
+            ows_error(StatusCode::INTERNAL_SERVER_ERROR, "NoApplicableCode", INTERNAL_ERROR)
         }
     }
 }
@@ -281,7 +285,8 @@ fn base_url(app: &App, headers: &HeaderMap) -> String {
 }
 
 fn caps(app: &App, headers: &HeaderMap, restful: bool) -> Response {
-    let base = base_url(app, headers);
+    // Escaped once: from Host/X-Forwarded-Host when no public URL is configured, and only used in XML.
+    let base = xml_escape(&base_url(app, headers));
     let cfg = &app.mgr.cfg;
     let mut layers_xml = String::new();
     let mut sets: Vec<&TileGrid> = vec![];

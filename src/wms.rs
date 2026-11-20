@@ -231,8 +231,12 @@ impl Wms {
                 }
             }
         }
-        let result = merge(imgs, query.size, transparent, bgcolor).map_err(|e| err("", format!("{e:#}")))?;
-        let (ctype, body) = encode(result, format, transparent).map_err(|e| err("", format!("{e:#}")))?;
+        let internal = |e: anyhow::Error| {
+            tracing::warn!("WMS GetMap: {e:#}");
+            err("", crate::server::INTERNAL_ERROR.into())
+        };
+        let result = merge(imgs, query.size, transparent, bgcolor).map_err(internal)?;
+        let (ctype, body) = encode(result, format, transparent).map_err(internal)?;
         let mut r = Response::new(Body::from(body));
         r.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static(ctype));
         if !cacheable {

@@ -177,6 +177,31 @@ async fn transient_503s_are_retried_until_backoff_runs_out() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_tiles_do_not_leak_backend_details() {
+    let env = Env::new("leak").await;
+    let base = spawn(crate::server::app(env.mgr(0), None).unwrap()).await;
+    env.wms.fail_next.store(usize::MAX, Ordering::SeqCst);
+    let r = reqwest::get(tile_url(&base, 0, 0)).await.unwrap();
+    assert_eq!(r.status(), 500);
+    let body = r.text().await.unwrap();
+    assert!(body.contains(crate::server::INTERNAL_ERROR), "{body}");
+    // The error chain names the source URL (fake WMS on 127.0.0.1) and its 503 body.
+    assert!(!body.contains("127.0.0.1") && !body.contains("503") && !body.contains("source s1"), "{body}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn capabilities_escape_a_forged_host() {
+    let env = Env::new("caps").await;
+    let base = spawn(crate::server::app(env.mgr(0), None).unwrap()).await;
+    let client = reqwest::Client::new();
+    for path in ["/wmts/1.0.0/WMTSCapabilities.xml", "/service?SERVICE=WMTS&REQUEST=GetCapabilities"] {
+        let body = client.get(format!("{base}{path}")).header("x-forwarded-host", "evil\"><x y=\"").send().await.unwrap().text().await.unwrap();
+        assert!(!body.contains("evil\"><x"), "{path}: {body}");
+        assert!(body.contains("evil&quot;&gt;&lt;x y=&quot;"), "{path}: {body}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn wms_getmap_from_the_cache() {
     let env = Env::new("wms").await;
     let base = spawn(crate::server::app(env.mgr(0), None).unwrap()).await;

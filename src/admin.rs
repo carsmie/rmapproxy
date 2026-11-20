@@ -1805,6 +1805,12 @@ pub fn worker_token() -> Option<String> {
     std::env::var("RMAPPROXY_WORKER_TOKEN").ok().filter(|t| !t.is_empty())
 }
 
+/// Equality without an early exit, so response timing doesn't reveal how much of a guessed token
+/// matched (only its length). black_box keeps the optimiser from short-circuiting the fold.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && std::hint::black_box(a.iter().zip(b).fold(0u8, |acc, (x, y)| std::hint::black_box(acc | (x ^ y)))) == 0
+}
+
 async fn guard(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
     if req.method() != axum::http::Method::GET && cross_site(req.headers()) {
         return msg(StatusCode::FORBIDDEN, "Forespørsler fra andre nettsteder er ikke tillatt.");
@@ -1813,7 +1819,7 @@ async fn guard(req: axum::extract::Request, next: axum::middleware::Next) -> Res
         && let Some(token) = worker_token()
     {
         let sent = req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
-        if sent != Some(token.as_str()) {
+        if !sent.is_some_and(|s| ct_eq(s.as_bytes(), token.as_bytes())) {
             return msg(StatusCode::UNAUTHORIZED, "Ugyldig eller manglende arbeider-token.");
         }
     }
@@ -1980,6 +1986,15 @@ mod tests {
         assert!(valid_id("20261027-101530-seed"));
         assert!(!valid_id("../x") && !valid_id(".hidden") && !valid_id("a/b"));
         assert_eq!(url_escape("a b,c&d"), "a%20b,c%26d");
+    }
+
+    #[test]
+    fn token_compare_is_exact() {
+        assert!(ct_eq(b"s3cret-token", b"s3cret-token"));
+        assert!(!ct_eq(b"s3cret-token", b"s3cret-tokeN"));
+        assert!(!ct_eq(b"s3cret-token", b"s3cret"));
+        assert!(!ct_eq(b"", b"x"));
+        assert!(ct_eq(b"", b""));
     }
 
     #[test]
