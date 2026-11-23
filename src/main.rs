@@ -9,6 +9,7 @@ mod e2e_tests;
 mod grid;
 mod image;
 mod legend;
+mod login;
 mod metrics;
 mod pickle;
 mod pyfloat;
@@ -120,6 +121,7 @@ fn main() -> Result<()> {
                         mapproxy_conf: std::path::absolute(&cfg_path)?,
                         seed_conf: std::path::absolute(seed_conf)?,
                         assets: std::path::absolute(assets)?,
+                        login: login::Login::from_env()?,
                     })
                 })
                 .transpose()?;

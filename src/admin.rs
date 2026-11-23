@@ -16,7 +16,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow, bail};
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{Path as UrlPath, State};
+use axum::extract::{Form, Path as UrlPath, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -28,6 +28,7 @@ use tracing::{info, warn};
 
 use crate::cache::write_atomic;
 use crate::config::load_yaml_with_bases;
+use crate::login::{self, Login, ct_eq};
 use crate::seed::{self, Mode};
 use crate::tile::TileManager;
 use crate::work::Queue;
@@ -53,6 +54,8 @@ pub struct AdminOpts {
     pub mapproxy_conf: PathBuf,
     pub seed_conf: PathBuf,
     pub assets: PathBuf,
+    /// None: no login (local use).
+    pub login: Option<Login>,
 }
 
 pub struct Admin {
@@ -1405,6 +1408,7 @@ impl Admin {
             "external": self.externals(),
             "workers": self.workers_json(),
             "workers_connected": self.workers_connected(),
+            "login": self.opts.login.is_some(),
             "max_jobs": self.max_jobs,
             "default_concurrency": self.concurrency,
             "stall_threshold_seconds": STALL_SECS,
@@ -1756,6 +1760,11 @@ pub fn router(admin: Arc<Admin>) -> Router {
         let a = admin.clone();
         tokio::spawn(a.generate_legends(false));
     }
+    match &admin.opts.login {
+        None => warn!("admin: RMAPPROXY_ADMIN_PASSWORD is not set, /_admin is open"),
+        Some(_) if worker_token().is_none() => warn!("admin: RMAPPROXY_WORKER_TOKEN is not set, seed workers are refused"),
+        Some(_) => {}
+    }
     Router::new()
         .route("/_admin", get(index))
         .route("/_admin/", get(index))
@@ -1779,7 +1788,9 @@ pub fn router(admin: Arc<Admin>) -> Router {
         .route("/_admin/stats/refresh", post(stats_refresh))
         .route("/_admin/legends", post(legends))
         .route("/_admin/{file}", get(asset))
-        .layer(axum::middleware::from_fn(guard))
+        .route("/_admin/login", get(login_page).post(login_submit))
+        .route("/_admin/logout", post(logout))
+        .layer(axum::middleware::from_fn_with_state(admin.clone(), guard))
         .with_state(admin)
 }
 
@@ -1802,28 +1813,55 @@ fn cross_site(h: &header::HeaderMap) -> bool {
 
 /// `RMAPPROXY_WORKER_TOKEN`, if set: the bearer token seed workers send on `/_admin/work/*`.
 pub fn worker_token() -> Option<String> {
-    std::env::var("RMAPPROXY_WORKER_TOKEN").ok().filter(|t| !t.is_empty())
+    std::env::var("RMAPPROXY_WORKER_TOKEN").ok().map(|t| t.trim().to_string()).filter(|t| !t.is_empty())
 }
 
-/// Equality without an early exit, so response timing doesn't reveal how much of a guessed token
-/// matched (only its length). black_box keeps the optimiser from short-circuiting the fold.
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && std::hint::black_box(a.iter().zip(b).fold(0u8, |acc, (x, y)| std::hint::black_box(acc | (x ^ y)))) == 0
-}
-
-async fn guard(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
-    if req.method() != axum::http::Method::GET && cross_site(req.headers()) {
+async fn guard(State(a): State<Arc<Admin>>, req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let (path, h) = (req.uri().path(), req.headers());
+    if req.method() != axum::http::Method::GET && cross_site(h) {
         return msg(StatusCode::FORBIDDEN, "Forespørsler fra andre nettsteder er ikke tillatt.");
     }
-    if req.uri().path().starts_with("/_admin/work/")
-        && let Some(token) = worker_token()
-    {
-        let sent = req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
-        if !sent.is_some_and(|s| ct_eq(s.as_bytes(), token.as_bytes())) {
+    if path.starts_with("/_admin/work/") {
+        let sent = h.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
+        let ok = match worker_token() {
+            Some(token) => sent.is_some_and(|s| ct_eq(s.as_bytes(), token.as_bytes())),
+            // Same ingress as the GUI: with a login but no token the work API stays closed.
+            None => a.opts.login.is_none(),
+        };
+        if !ok {
             return msg(StatusCode::UNAUTHORIZED, "Ugyldig eller manglende arbeider-token.");
         }
+    } else if let Some(l) = &a.opts.login
+        && !matches!(path, "/_admin/login" | "/_admin/logout" | "/_admin/admin.css")
+        && !l.logged_in(h)
+    {
+        return match path {
+            "/_admin" | "/_admin/" => login::redirect("/_admin/login", None),
+            _ => msg(StatusCode::UNAUTHORIZED, "Ikke logget inn."),
+        };
     }
     next.run(req).await
+}
+
+async fn login_page(State(a): State<Arc<Admin>>, h: header::HeaderMap) -> Response {
+    match &a.opts.login {
+        Some(l) if !l.logged_in(&h) => login::page(StatusCode::OK, false),
+        _ => login::redirect("/_admin", None),
+    }
+}
+
+async fn login_submit(State(a): State<Arc<Admin>>, h: header::HeaderMap, Form(f): Form<HashMap<String, String>>) -> Response {
+    match &a.opts.login {
+        Some(l) => l.login(&h, f.get("password").map_or("", String::as_str)).await,
+        None => login::redirect("/_admin", None),
+    }
+}
+
+async fn logout(State(a): State<Arc<Admin>>, h: header::HeaderMap) -> Response {
+    match &a.opts.login {
+        Some(l) => l.logout(&h),
+        None => login::redirect("/_admin", None),
+    }
 }
 
 #[allow(clippy::result_large_err)] // the error is the ready response
@@ -1986,15 +2024,6 @@ mod tests {
         assert!(valid_id("20261027-101530-seed"));
         assert!(!valid_id("../x") && !valid_id(".hidden") && !valid_id("a/b"));
         assert_eq!(url_escape("a b,c&d"), "a%20b,c%26d");
-    }
-
-    #[test]
-    fn token_compare_is_exact() {
-        assert!(ct_eq(b"s3cret-token", b"s3cret-token"));
-        assert!(!ct_eq(b"s3cret-token", b"s3cret-tokeN"));
-        assert!(!ct_eq(b"s3cret-token", b"s3cret"));
-        assert!(!ct_eq(b"", b"x"));
-        assert!(ct_eq(b"", b""));
     }
 
     #[test]

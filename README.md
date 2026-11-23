@@ -26,7 +26,9 @@ demand at once; requests for tiles of a metatile already being rendered wait for
 `seed-worker` on its own port, so metrics stay off the public service port.
 `/_admin` sends no CORS headers and refuses non-GET requests from other sites. With
 `RMAPPROXY_WORKER_TOKEN` set on the admin and the workers, `/_admin/work/*` requires it as a
-bearer token.
+bearer token. `RMAPPROXY_ADMIN_PASSWORD` (default unset: open) puts a login in front of the GUI and
+its API: one shared password, 12 h sessions in memory (`src/login.rs`). With it set,
+`/_admin/work/*` is refused unless `RMAPPROXY_WORKER_TOKEN` is set too.
 
 ## Status (2026-10-26)
 

@@ -224,6 +224,7 @@ async fn admin_has_no_cors_and_refuses_cross_site_posts() {
         mapproxy_conf: env.dir.join("mapproxy.yaml"),
         seed_conf: env.dir.join("seed.yaml"),
         assets: env.dir.join("admin"),
+        login: None,
     };
     let base = spawn(crate::server::app(env.mgr(0), Some(opts)).unwrap()).await;
     let client = reqwest::Client::new();
@@ -239,6 +240,58 @@ async fn admin_has_no_cors_and_refuses_cross_site_posts() {
     assert_eq!(post("same-origin").await.unwrap().status(), 200);
     let r = client.post(format!("{base}/_admin/stats/refresh")).header("origin", "https://elsewhere.example").send().await.unwrap();
     assert_eq!(r.status(), 403);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admin_login_guards_everything_but_the_login_page() {
+    let env = Env::new("login").await;
+    std::fs::create_dir_all(env.dir.join("admin")).unwrap();
+    for f in ["admin.html", "admin.js", "admin.css"] {
+        std::fs::write(env.dir.join("admin").join(f), "gui").unwrap();
+    }
+    let opts = crate::admin::AdminOpts {
+        mapproxy_conf: env.dir.join("mapproxy.yaml"),
+        seed_conf: env.dir.join("seed.yaml"),
+        assets: env.dir.join("admin"),
+        login: Some(crate::login::Login::new("hemmelig".into())),
+    };
+    let base = spawn(crate::server::app(env.mgr(0), Some(opts)).unwrap()).await;
+    let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+    let get = |path: &str, cookie: &str| client.get(format!("{base}{path}")).header(header::COOKIE, cookie).send();
+    let post = |path: &str, cookie: &str, body: &'static str| {
+        client.post(format!("{base}{path}")).header(header::COOKIE, cookie).header(header::CONTENT_TYPE, "application/x-www-form-urlencoded").body(body).send()
+    };
+
+    for p in ["/_admin", "/_admin/"] {
+        let r = get(p, "").await.unwrap();
+        assert_eq!((r.status().as_u16(), &r.headers()[header::LOCATION]), (303, &"/_admin/login".parse().unwrap()));
+    }
+    for p in ["status", "tasks", "history", "jobs/x", "admin.html", "admin.js", "%61dmin.html"] {
+        assert_eq!(get(&format!("/_admin/{p}"), "rmapproxy_admin=guess").await.unwrap().status(), 401, "{p}");
+    }
+    // Without a worker token the work API is closed too (it shares the ingress).
+    for p in ["jobs", "estimate", "jobs/x/stop", "stats/refresh", "legends", "work/claim", "work/complete"] {
+        assert_eq!(post(&format!("/_admin/{p}"), "", "{}").await.unwrap().status(), 401, "{p}");
+    }
+    for p in ["/_admin/login", "/_admin/admin.css", "/healthz"] {
+        assert_eq!(get(p, "").await.unwrap().status(), 200, "{p}");
+    }
+    let r = post("/_admin/login", "", "password=feil").await.unwrap();
+    assert_eq!((r.status().as_u16(), r.headers().get(header::SET_COOKIE)), (401, None));
+
+    let r = post("/_admin/login", "", "username=admin&password=hemmelig").await.unwrap();
+    assert_eq!(r.status(), 303);
+    let set = r.headers()[header::SET_COOKIE].to_str().unwrap().to_string();
+    assert!(set.contains("HttpOnly") && set.contains("SameSite=Lax"), "{set}");
+    let cookie = set.split(';').next().unwrap();
+    assert_eq!(get("/_admin", cookie).await.unwrap().status(), 200);
+    assert_eq!(get("/_admin/status", cookie).await.unwrap().status(), 200);
+    assert_eq!(post("/_admin/stats/refresh", cookie, "").await.unwrap().status(), 200);
+    assert_eq!(get("/_admin/login", cookie).await.unwrap().status(), 303);
+    // A session is no worker token, and logout ends it on the server.
+    assert_eq!(post("/_admin/work/claim", cookie, "{}").await.unwrap().status(), 401);
+    assert_eq!(post("/_admin/logout", cookie, "").await.unwrap().status(), 303);
+    assert_eq!(get("/_admin/status", cookie).await.unwrap().status(), 401);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -301,6 +354,7 @@ async fn distributed_failed_chunks_are_retried_before_the_job_fails() {
         mapproxy_conf: env.dir.join("mapproxy.yaml"),
         seed_conf: env.dir.join("seed.yaml"),
         assets: env.dir.join("admin"),
+        login: None,
     };
     let base = spawn(crate::server::app(env.mgr(0), Some(opts)).unwrap()).await;
     // Source down for two rounds (rGIS OOM storm), then fine: the job ends done.
