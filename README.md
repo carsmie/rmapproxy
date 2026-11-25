@@ -65,6 +65,12 @@ tnt-rmapproxy's `admin/`. A seed job can be distributed: the admin splits it int
 pods lease, render and report them (`src/work.rs`; leases expire after 2 min, SIGTERM hands the
 chunk back). Verified: the chunked job writes exactly the tile set of `rmapproxy seed` for the
 same tasks (3 237/3 237 files, byte-identical, incl. a polygon coverage).
+`bbox` tasks take `grids`: `"all"` (every grid of the cache) or a list; default is the grids of the
+seed.yaml task with the same caches. `POST /_admin/jobs` with `mode: "refresh"` and `delete_from`
+(order-wide or per task) re-renders levels below it and deletes the rest of each `bbox` task: one
+seed job (`distributed: true` sends it to the workers) and one cleanup job in the admin pod, both
+validated before either starts; `GET /_admin/orders/{id}` gives their combined state. Levels are
+each grid's own (webmercator z is ~1.6 coarser than UTM z at 65°N); use a task per grid to differ.
 
 2026-10-26, against MapProxy 7.0 with a deterministic fake WMS (RGBA, paletted+tRNS, opaque
 RGB, polygon coverage sub-queries):

@@ -363,6 +363,77 @@ async fn distributed_failed_chunks_are_retried_before_the_job_fails() {
     assert_eq!(run_distributed(&base, |_| 1).await, (3, "failed".into()));
 }
 
+/// Bbox tasks on every grid of the cache, and refresh orders: levels split at `delete_from`,
+/// bad requests start nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn refresh_orders_split_levels_and_cover_all_grids() {
+    use serde_json::json;
+    let env = Env::new("order").await;
+    let conf = env.dir.join("mapproxy.yaml");
+    let y = std::fs::read_to_string(&conf).unwrap();
+    let y = y.replace("caches:\n  c: {grids: [g]", "  g32: {srs: 'EPSG:25832', origin: nw, bbox: [-2000000, 3500000, 3545984, 9045984], tile_size: [256, 256], res: [21664, 10832]}\ncaches:\n  c: {grids: [g, g32]");
+    std::fs::write(&conf, y).unwrap();
+    let seed = std::fs::read_to_string(env.dir.join("seed.yaml")).unwrap();
+    std::fs::write(env.dir.join("seed.yaml"), seed.replace("s: {caches: [c],", "s: {caches: [c], grids: [g],")).unwrap();
+    let opts = crate::admin::AdminOpts {
+        mapproxy_conf: conf.clone(),
+        seed_conf: env.dir.join("seed.yaml"),
+        assets: env.dir.join("admin"),
+        login: None,
+    };
+    let base = spawn(crate::server::app(env.mgr(0), Some(opts)).unwrap()).await;
+    let bbox = json!([5.0, 1.0, 6.0, 2.0]);
+    let grids_of = |v: &serde_json::Value| -> Vec<String> { v["tasks"].as_array().unwrap().iter().map(|t| t["grid"].as_str().unwrap().to_string()).collect() };
+    let t = |g: serde_json::Value| json!({"tasks": [{"name": "a", "bbox": bbox, "caches": ["c"], "grids": g}]});
+    for (g, want) in [(json!(null), vec!["g"]), (json!("all"), vec!["g", "g32"]), (json!(["g32"]), vec!["g32"])] {
+        let (st, e) = admin_post(&base, "estimate", t(g)).await;
+        assert_eq!((st, grids_of(&e)), (200, want.iter().map(|s| s.to_string()).collect()));
+    }
+    assert_eq!(admin_post(&base, "estimate", t(json!(["nope"]))).await.0, 400);
+    assert_eq!(admin_post(&base, "estimate", t(json!([]))).await.0, 400);
+
+    let ok = json!({"name": "a", "bbox": bbox, "caches": ["c"], "grids": "all", "levels_from": 0, "levels_to": 1});
+    let with = |k: &str, v: serde_json::Value| {
+        let mut x = ok.clone();
+        x[k] = v;
+        x
+    };
+    let order = |tasks: serde_json::Value| json!({"mode": "refresh", "delete_from": 2, "distributed": true, "tasks": tasks});
+    for bad in [
+        json!([]),
+        json!([ok, ok]),
+        json!([ok, {"name": "b", "bbox": [5, 1, 6], "caches": ["c"]}]),
+        json!([with("caches", json!(["c", "nope"]))]),
+        json!([with("caches", json!(null))]),
+        json!([with("name", json!("s"))]),
+        json!([with("delete_from", json!("x"))]),
+        json!([with("levels_from", json!(2))]),
+        json!([with("grids", json!(["nope"]))]),
+    ] {
+        let (st, e) = admin_post(&base, "jobs", order(bad.clone())).await;
+        assert_eq!(st, 400, "{bad} -> {e}");
+    }
+    let mut no_split = order(json!([ok]));
+    no_split["delete_from"] = json!(null);
+    assert_eq!(admin_post(&base, "jobs", no_split).await.0, 400);
+    let get = |path: String| async move { serde_json::from_slice::<serde_json::Value>(&reqwest::get(path).await.unwrap().bytes().await.unwrap()).unwrap() };
+    assert_eq!(get(format!("{base}/_admin/status")).await["jobs"], json!([]));
+
+    let (st, o) = admin_post(&base, "jobs", order(json!([ok]))).await;
+    assert_eq!((st, o["jobs"].as_array().map(Vec::len)), (200, Some(1)), "{o}");
+    let url = format!("{base}/_admin/orders/{}", o["id"].as_str().unwrap());
+    let v = get(url.clone()).await;
+    assert_eq!((&v["state"], v["jobs"][0]["progress"].as_array().map(Vec::len)), (&json!("running"), Some(2)), "{v}");
+    loop {
+        let (st, c) = admin_post(&base, "work/claim", json!({"worker": "w"})).await;
+        if st == 204 {
+            break;
+        }
+        admin_post(&base, "work/complete", json!({"worker": "w", "job": c["job"].as_str().unwrap_or(o["jobs"][0].as_str().unwrap()), "chunk": c["chunk"], "tiles": 1, "errors": 0, "metatiles": 1})).await;
+    }
+    assert_eq!(get(url).await["state"], "done");
+}
+
 /// Renders, coalesced waits, source retries and routes are counted; client input is not a label.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn metrics_count_tiles_and_sources_without_client_labels() {

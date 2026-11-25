@@ -114,8 +114,10 @@ struct Stats {
 struct Job {
     id: String,
     mode: Mode,
-    /// Normalised request tasks: {name, levels_from, levels_to, bbox?, caches?}.
+    /// Normalised request tasks: {name, levels_from, levels_to, bbox?, caches?, grids?}.
     tasks: Json,
+    /// `{id, jobs: [id…]}` of the refresh order this job is part of, else null.
+    order: Json,
     names: Vec<String>,
     refresh: String,
     concurrency: usize,
@@ -139,6 +141,13 @@ struct Job {
     /// Distributed job: its chunks (no local process).
     queue: Option<Queue>,
     last_persist: Instant,
+}
+
+/// A validated job and its configuration, not started yet.
+struct Prepared {
+    job: Job,
+    conf: Yaml,
+    warning: Option<String>,
 }
 
 #[derive(Clone)]
@@ -408,6 +417,7 @@ impl Admin {
             "mode": mode_str(job.mode),
             "source": "manual",
             "refresh": job.refresh,
+            "order": job.order,
             "tiles": job.tiles,
             "errors": job.errors,
         }));
@@ -496,22 +506,34 @@ impl Admin {
                 if b.len() != 4 || !(b[0] < b[2] && b[1] < b[3] && b[0] >= -180.0 && b[2] <= 180.0 && b[1] >= -90.0 && b[3] <= 90.0) {
                     bail!("{name}: ugyldig bbox (V < Ø, S < N, WGS84)");
                 }
-                let caches: Vec<String> = t["caches"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|c| c.as_str())
-                    .filter(|c| cache_names.contains(c))
-                    .map(String::from)
-                    .collect();
+                // An unknown cache must not fall through to the default one (cleanups delete there).
+                let caches: Vec<String> = match &t["caches"] {
+                    Json::Null => vec![],
+                    Json::Array(a) => a
+                        .iter()
+                        .map(|c| c.as_str().filter(|c| cache_names.contains(c)).map(String::from).ok_or_else(|| anyhow!("{name}: ukjent cache {c}")))
+                        .collect::<Result<_>>()?,
+                    c => bail!("{name}: caches må være en liste, ikke {c}"),
+                };
                 let caches_y: Yaml = if caches.is_empty() {
                     first.get("caches").cloned().unwrap_or_else(|| vec!["topo_cache"].into())
                 } else {
                     caches.iter().map(String::as_str).collect::<Vec<_>>().into()
                 };
-                // The grid must fit the cache (topo_cache_2x has only norway_25833_2x): from a
-                // seed.yaml task with the same caches.
-                let grids = seeds.values().find(|s| s.get("caches") == Some(&caches_y)).unwrap_or(&first).get("grids").cloned();
+                let grids: Option<Yaml> = match &t["grids"] {
+                    // The grid must fit the cache (topo_cache_2x has only *_2x grids): from a
+                    // seed.yaml task with the same caches.
+                    Json::Null => seeds.values().find(|s| s.get("caches") == Some(&caches_y)).unwrap_or(&first).get("grids").cloned(),
+                    // No grids: load_tasks_from takes every grid of each cache.
+                    Json::String(a) if a == "all" => None,
+                    Json::Array(a) if !a.is_empty() => {
+                        Some(a.iter().map(|g| g.as_str().map(Yaml::from).ok_or_else(|| anyhow!("{name}: ugyldig grid {g}"))).collect::<Result<Vec<_>>>()?.into())
+                    }
+                    g => bail!("{name}: grids må være \"all\" eller en liste, ikke {g}"),
+                };
+                if !t["grids"].is_null() {
+                    nt["grids"] = t["grids"].clone();
+                }
                 let cov = format!("{name}_cov");
                 let mut c = Mapping::new();
                 c.insert("bbox".into(), b.clone().into());
@@ -641,7 +663,8 @@ impl Admin {
         id
     }
 
-    fn start(self: &Arc<Self>, req: &Json) -> Result<Json> {
+    /// Validates a one-mode request and builds its job; no side effects.
+    fn prepare(&self, req: &Json) -> Result<Prepared> {
         let mode = match req["mode"].as_str().unwrap_or("seed") {
             "seed" => Mode::Seed,
             "cleanup" => Mode::Cleanup,
@@ -654,19 +677,15 @@ impl Admin {
         if distributed && mode != Mode::Seed {
             bail!("sletting kjøres i admin-poden, ikke på arbeiderne");
         }
-        if !distributed && self.running_count() >= self.max_jobs {
-            bail!("maks {} samtidige jobber i admin-poden kjører allerede", self.max_jobs);
-        }
         let queue = if distributed { Some(Queue::build(&seed_tasks)?) } else { None };
         let concurrency = req["concurrency"].as_u64().map_or(self.concurrency, |c| (c as usize).clamp(1, 64));
         let warning = self.overlap_warning(&names);
-        let id = self.new_id(mode);
-        std::fs::write(self.job_conf_path(&id), serde_yaml::to_string(&conf)?).context("writing job configuration")?;
         let now = SystemTime::now();
         let job = Job {
-            id: id.clone(),
+            id: self.new_id(mode),
             mode,
             tasks,
+            order: Json::Null,
             names,
             refresh,
             concurrency,
@@ -687,14 +706,46 @@ impl Admin {
             queue,
             last_persist: Instant::now(),
         };
+        Ok(Prepared { job, conf, warning })
+    }
+
+    /// Room for `local` more in-pod jobs?
+    fn check_slots(&self, local: usize) -> Result<()> {
+        if local > 0 && self.running_count() + local > self.max_jobs {
+            bail!("maks {} samtidige jobber i admin-poden (bestillingen trenger {local})", self.max_jobs);
+        }
+        Ok(())
+    }
+
+    fn start(self: &Arc<Self>, req: &Json) -> Result<Json> {
+        if req["mode"] == "refresh" {
+            return self.start_order(req);
+        }
+        let p = self.prepare(req)?;
+        self.check_slots(p.job.queue.is_none() as usize)?;
+        self.commit(p)
+    }
+
+    fn commit(self: &Arc<Self>, p: Prepared) -> Result<Json> {
+        let Prepared { mut job, conf, warning } = p;
+        let id = job.id.clone();
+        std::fs::write(self.job_conf_path(&id), serde_yaml::to_string(&conf)?).context("writing job configuration")?;
         if let Some((n, est)) = job.queue.as_ref().map(|q| (q.len(), q.est_total)) {
-            let mut job = job;
             job.runs = 1;
             job.log.push_back(format!("Fordelt: {n} chunks (~{est} metafliser) til seed-arbeiderne."));
-            self.persist(&job);
+            if n == 0 {
+                // Nothing for a worker to complete: done now, else it stays running forever.
+                job.state = "done";
+                job.exit_code = Some(0);
+                job.finished_at = Some(SystemTime::now());
+                self.append_history(&job);
+                self.remove_files(&id);
+            } else {
+                self.persist(&job);
+            }
             self.jobs.lock().push(job);
             let mut out = json!({ "id": id, "message": format!("Jobb {id} startet, fordelt på {n} chunks.") });
-            if self.workers_connected() == 0 {
+            if self.workers_connected() == 0 && n > 0 {
                 out["warning"] = "Ingen seed-arbeidere er tilkoblet; jobben venter til en kobler seg på.".into();
             } else if let Some(w) = warning {
                 out["warning"] = w.into();
@@ -712,6 +763,138 @@ impl Admin {
             out["warning"] = w.into();
         }
         Ok(out)
+    }
+
+    /// `mode: refresh`: re-render `bbox` tasks below `delete_from`, delete from it up. One seed and
+    /// one cleanup job sharing an order; both are validated before either starts.
+    fn start_order(self: &Arc<Self>, req: &Json) -> Result<Json> {
+        let seeds = self.seed_conf.get("seeds");
+        let cleanups = self.seed_conf.get("cleanups");
+        let (mut render, mut delete, mut seen) = (vec![], vec![], HashSet::new());
+        for t in req["tasks"].as_array().map(Vec::as_slice).unwrap_or_default() {
+            let name = t["name"].as_str().unwrap_or_default();
+            // build_conf would rename, skip or reinterpret these; an order must do all it was sent.
+            if name.is_empty() || name.len() > 64 || !name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_') {
+                bail!("ugyldig oppgavenavn {name:?}");
+            }
+            if !seen.insert(name) {
+                bail!("{name}: oppgavenavnet er brukt to ganger");
+            }
+            if [seeds, cleanups].into_iter().flatten().any(|s| s.get(name).is_some()) {
+                bail!("{name}: navnet finnes i seed.yaml");
+            }
+            if t["bbox"].as_array().is_none_or(|b| b.len() != 4 || b.iter().any(|v| !v.is_number())) {
+                bail!("{name}: bbox må være fire tall");
+            }
+            let caches: Vec<&str> = t["caches"].as_array().into_iter().flatten().filter_map(|c| c.as_str()).collect();
+            if caches.is_empty() {
+                bail!("{name}: caches mangler");
+            }
+            let level = |t: &Json, k: &str| -> Result<Option<u64>> {
+                match &t[k] {
+                    Json::Null => Ok(None),
+                    v => v.as_u64().filter(|l| *l <= 30).map(Some).ok_or_else(|| anyhow!("{name}: ugyldig {k} {v}")),
+                }
+            };
+            let split = match level(t, "delete_from")? {
+                Some(d) => d,
+                None => level(req, "delete_from")?.ok_or_else(|| anyhow!("{name}: delete_from mangler"))?,
+            };
+            let deepest = caches
+                .iter()
+                .filter_map(|c| self.mgr.cfg.caches.get(*c))
+                .flat_map(|c| &c.grids)
+                .filter_map(|g| self.mgr.cfg.grids.get(g))
+                .map(|g| g.res.len() as u64)
+                .max()
+                .unwrap_or(1)
+                - 1;
+            let (from, to) = (level(t, "levels_from")?.unwrap_or(0), level(t, "levels_to")?.unwrap_or(deepest));
+            if from > to {
+                bail!("{name}: levels_from > levels_to");
+            }
+            let part = |a: u64, b: u64| {
+                let mut p = t.clone();
+                p["levels_from"] = a.into();
+                p["levels_to"] = b.into();
+                p
+            };
+            if from < split {
+                render.push(part(from, to.min(split - 1)));
+            }
+            if to >= split {
+                delete.push(part(from.max(split), to));
+            }
+        }
+        if render.is_empty() && delete.is_empty() {
+            bail!("ingen gyldige oppgaver valgt");
+        }
+        let mut parts = vec![];
+        if !render.is_empty() {
+            let mut r = json!({ "mode": "seed", "refresh": "all", "tasks": render, "distributed": req["distributed"] == true });
+            r["concurrency"] = req["concurrency"].clone();
+            parts.push(self.prepare(&r)?);
+        }
+        if !delete.is_empty() {
+            let mut r = json!({ "mode": "cleanup", "refresh": "all", "tasks": delete });
+            r["concurrency"] = req["concurrency"].clone();
+            parts.push(self.prepare(&r)?);
+        }
+        self.check_slots(parts.iter().filter(|p| p.job.queue.is_none()).count())?;
+        let ids: Vec<String> = parts.iter().map(|p| p.job.id.clone()).collect();
+        let order = json!({ "id": format!("{}-ordre", ids[0]), "jobs": ids });
+        let (mut warnings, mut started): (Vec<String>, Vec<String>) = (vec![], vec![]);
+        for mut p in parts {
+            p.job.order = order.clone();
+            let id = p.job.id.clone();
+            match self.commit(p) {
+                Ok(o) => warnings.extend(o["warning"].as_str().map(String::from)),
+                Err(e) => {
+                    for s in &started {
+                        self.stop(s);
+                    }
+                    return Err(e.context(format!("jobb {id} startet ikke; stoppet {started:?}")));
+                }
+            }
+            started.push(id);
+        }
+        let mut out = json!({ "id": order["id"], "jobs": order["jobs"], "message": format!("Bestilling {} startet: {}.", order["id"].as_str().unwrap_or_default(), started.join(", ")) });
+        if !warnings.is_empty() {
+            out["warning"] = warnings.join(" ").into();
+        }
+        Ok(out)
+    }
+
+    /// A refresh order's jobs and combined state: running while any part is, done only if all are.
+    /// Parts no longer in memory (finished before a restart) come from the history.
+    fn order_json(&self, id: &str) -> Option<Json> {
+        let history = self.read_history();
+        let mut jobs = self.jobs.lock();
+        let order = jobs
+            .iter()
+            .map(|j| &j.order)
+            .chain(history.iter().map(|h| &h["order"]))
+            .find(|o| o["id"] == id)?
+            .clone();
+        let mut parts = vec![];
+        for jid in order["jobs"].as_array()?.iter().filter_map(|j| j.as_str()) {
+            parts.push(match jobs.iter_mut().find(|j| j.id == jid) {
+                Some(j) => self.job_json(j, false),
+                None => match history.iter().rev().find(|h| h["key"] == jid) {
+                    Some(h) => json!({ "id": jid, "mode": h["mode"], "state": h["state"], "finished_at": h["finished_at"], "tiles": h["tiles"], "errors": h["errors"] }),
+                    None => json!({ "id": jid, "state": "unknown" }),
+                },
+            });
+        }
+        let any = |s: &str| parts.iter().any(|p| p["state"] == s);
+        let state = if any("running") || any("stopping") {
+            "running"
+        } else if parts.iter().all(|p| p["state"] == "done") {
+            "done"
+        } else {
+            "failed"
+        };
+        Some(json!({ "id": id, "state": state, "jobs": parts }))
     }
 
     /// Spawn `rmapproxy seed` for job `id` (state already set to running).
@@ -972,6 +1155,7 @@ impl Admin {
             "duration_seconds": duration,
             "exit_code": j.exit_code,
             "tasks": j.tasks,
+            "order": j.order,
             "refresh": j.refresh,
             "concurrency": j.concurrency,
             "runs": j.runs,
@@ -1022,6 +1206,7 @@ impl Admin {
             "duration_seconds": duration,
             "exit_code": j.exit_code,
             "tasks": j.tasks,
+            "order": j.order,
             "refresh": j.refresh,
             "concurrency": j.concurrency,
             "runs": j.runs,
@@ -1255,6 +1440,9 @@ impl Admin {
     // ── estimate ────────────────────────────────────────────────────────────
 
     fn estimate(&self, req: &Json) -> Result<Json> {
+        if req["mode"] == "refresh" {
+            bail!("estimat støtter bare seed og cleanup");
+        }
         let mode = if req["mode"] == "cleanup" { Mode::Cleanup } else { Mode::Seed };
         let (conf, names, _, _) = self.build_conf(req, mode)?;
         let tasks = seed::load_tasks_from(&self.mgr, &conf, &self.dir, &names, mode)?;
@@ -1429,7 +1617,7 @@ impl Job {
     fn record(&self) -> Json {
         let mut r = json!({
             "id": self.id, "mode": mode_str(self.mode), "tasks": self.tasks, "names": self.names,
-            "refresh": self.refresh, "concurrency": self.concurrency,
+            "order": self.order, "refresh": self.refresh, "concurrency": self.concurrency,
             "created_at": secs(self.created_at), "run_started_at": secs(self.run_started_at),
             "finished_at": self.finished_at.map(secs), "exit_code": self.exit_code, "state": self.state,
             "runs": self.runs, "tiles": self.tiles, "errors": self.errors,
@@ -1457,6 +1645,7 @@ impl Job {
             id: r["id"].as_str().filter(|i| valid_id(i))?.to_string(),
             mode: if r["mode"] == "cleanup" { Mode::Cleanup } else { Mode::Seed },
             tasks: r["tasks"].clone(),
+            order: r["order"].clone(),
             names: r["names"].as_array()?.iter().filter_map(|n| n.as_str().map(String::from)).collect(),
             refresh: r["refresh"].as_str().unwrap_or_default().into(),
             concurrency: r["concurrency"].as_u64().unwrap_or(4) as usize,
@@ -1774,6 +1963,7 @@ pub fn router(admin: Arc<Admin>) -> Router {
         .route("/_admin/estimate", post(estimate))
         .route("/_admin/jobs", post(start))
         .route("/_admin/jobs/{id}", get(job))
+        .route("/_admin/orders/{id}", get(order))
         .route("/_admin/jobs/{id}/stop", post(|State(a): State<Arc<Admin>>, UrlPath(id): UrlPath<String>| async move { a.stop(&id) }))
         .route("/_admin/jobs/{id}/resume", post(|State(a): State<Arc<Admin>>, UrlPath(id): UrlPath<String>| async move { a.resume(&id) }))
         .route("/_admin/jobs/{id}/discard", post(|State(a): State<Arc<Admin>>, UrlPath(id): UrlPath<String>| async move { a.discard(&id) }))
@@ -1917,7 +2107,7 @@ async fn start(State(a): State<Arc<Admin>>, body: Bytes) -> Response {
         Ok(r) => r,
         Err(r) => return r,
     };
-    if req["distributed"] != true && a.running_count() >= a.max_jobs {
+    if req["distributed"] != true && req["mode"] != "refresh" && a.running_count() >= a.max_jobs {
         return msg(StatusCode::CONFLICT, format!("Maks {} samtidige jobber kjører allerede i admin-poden. Stopp en av dem, eller fordel jobben på arbeiderne.", a.max_jobs));
     }
     // Chunking a national job tests ~10⁵–10⁶ blocks against the coverage: off the runtime.
@@ -1933,6 +2123,13 @@ async fn job(State(a): State<Arc<Admin>>, UrlPath(id): UrlPath<String>) -> Respo
     match jobs.iter_mut().find(|j| j.id == id) {
         Some(j) => resp(StatusCode::OK, a.job_json(j, true)),
         None => msg(StatusCode::NOT_FOUND, "Ukjent jobb."),
+    }
+}
+
+async fn order(State(a): State<Arc<Admin>>, UrlPath(id): UrlPath<String>) -> Response {
+    match a.order_json(&id) {
+        Some(o) => resp(StatusCode::OK, o),
+        None => msg(StatusCode::NOT_FOUND, "Ukjent bestilling."),
     }
 }
 
