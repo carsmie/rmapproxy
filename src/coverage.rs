@@ -17,6 +17,17 @@ pub struct Coverage {
     pub bbox: BBox,
     /// Polygons as rings (first = exterior); empty for a bbox coverage.
     polygons: Vec<Vec<Ring>>,
+    /// union/intersection/difference of inline child coverages; then srs/bbox describe the
+    /// result's extent (in the first child's SRS) and polygons is empty.
+    op: Option<(Op, Vec<Coverage>)>,
+}
+
+/// MapProxy's `MultiCoverage`/`IntersectionCoverage`/`DiffCoverage` (`util/coverage.py`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Op {
+    Union,
+    Intersection,
+    Difference,
 }
 
 impl Coverage {
@@ -24,19 +35,33 @@ impl Coverage {
         if c.get("clip").and_then(|v| v.as_bool()) == Some(true) {
             bail!("coverage clip: true is not supported");
         }
+        for (key, op) in [("union", Op::Union), ("intersection", Op::Intersection), ("difference", Op::Difference)] {
+            let Some(list) = c.get(key) else { continue };
+            let children = list
+                .as_sequence()
+                .ok_or_else(|| anyhow!("{key}: expected a list of coverages"))?
+                .iter()
+                .enumerate()
+                .map(|(i, cc)| Coverage::from_conf(cc, abspath).with_context(|| format!("{key}[{i}]")))
+                .collect::<Result<Vec<_>>>()?;
+            if children.is_empty() {
+                bail!("{key}: needs at least one coverage");
+            }
+            return Coverage::combine(op, children);
+        }
         let srs_of = |k: &str| c.get(k).and_then(|s| s.as_str());
         if let Some(b) = c.get("bbox") {
             let srs = Srs::new(srs_of("bbox_srs").or(srs_of("srs")).ok_or_else(|| anyhow!("coverage without srs"))?)?;
-            return Ok(Coverage { srs, bbox: parse_bbox(b)?, polygons: vec![] });
+            return Ok(Coverage { srs, bbox: parse_bbox(b)?, polygons: vec![], op: None });
         }
         let ds = c.get("datasource").ok_or_else(|| anyhow!("coverage needs bbox or datasource"))?;
         let srs = Srs::new(srs_of("srs").ok_or_else(|| anyhow!("coverage without srs"))?)?;
         if ds.is_sequence() {
-            return Ok(Coverage { srs, bbox: parse_bbox(ds)?, polygons: vec![] });
+            return Ok(Coverage { srs, bbox: parse_bbox(ds)?, polygons: vec![], op: None });
         }
         let ds = ds.as_str().ok_or_else(|| anyhow!("bad datasource"))?;
         if let Ok(b) = parse_bbox(&Value::String(ds.into())) {
-            return Ok(Coverage { srs, bbox: b, polygons: vec![] });
+            return Ok(Coverage { srs, bbox: b, polygons: vec![], op: None });
         }
         Coverage::from_geojson(&abspath(ds), srs)
     }
@@ -82,17 +107,20 @@ impl Coverage {
         if polygons.is_empty() {
             bail!("{}: no polygons", path.display());
         }
-        Ok(Coverage { srs, bbox, polygons })
+        Ok(Coverage { srs, bbox, polygons, op: None })
     }
 
     /// `Coverage.transform_to(srs)`: a bbox coverage by its 16-point envelope, polygons
     /// vertex by vertex (`transform_geometry`, no densification).
     pub fn transform_to(&self, srs: &Srs) -> Result<Coverage> {
+        if let Some((op, children)) = &self.op {
+            return Coverage::combine(*op, children.iter().map(|c| c.transform_to(srs)).collect::<Result<_>>()?);
+        }
         if *srs == self.srs {
-            return Ok(Coverage { srs: self.srs.clone(), bbox: self.bbox, polygons: self.polygons.clone() });
+            return Ok(Coverage { srs: self.srs.clone(), bbox: self.bbox, polygons: self.polygons.clone(), op: None });
         }
         if self.polygons.is_empty() {
-            return Ok(Coverage { srs: srs.clone(), bbox: self.srs.transform_bbox(srs, self.bbox)?, polygons: vec![] });
+            return Ok(Coverage { srs: srs.clone(), bbox: self.srs.transform_bbox(srs, self.bbox)?, polygons: vec![], op: None });
         }
         let mut polygons = Vec::with_capacity(self.polygons.len());
         for p in &self.polygons {
@@ -106,7 +134,23 @@ impl Coverage {
         for &(x, y) in polygons.iter().filter_map(|p| p.first()).flatten() {
             bbox = [bbox[0].min(x), bbox[1].min(y), bbox[2].max(x), bbox[3].max(y)];
         }
-        Ok(Coverage { srs: srs.clone(), bbox, polygons })
+        Ok(Coverage { srs: srs.clone(), bbox, polygons, op: None })
+    }
+
+    /// Extent of an operator coverage in the first child's SRS: union = all child extents,
+    /// intersection = their overlap, difference = the first child's.
+    fn combine(op: Op, children: Vec<Coverage>) -> Result<Coverage> {
+        let srs = children[0].srs.clone();
+        let mut bbox = children[0].bbox;
+        for c in &children[1..] {
+            let b = c.srs.transform_bbox(&srs, c.bbox)?;
+            bbox = match op {
+                Op::Union => [bbox[0].min(b[0]), bbox[1].min(b[1]), bbox[2].max(b[2]), bbox[3].max(b[3])],
+                Op::Intersection => [bbox[0].max(b[0]), bbox[1].max(b[1]), bbox[2].min(b[2]), bbox[3].min(b[3])],
+                Op::Difference => bbox,
+            };
+        }
+        Ok(Coverage { srs, bbox, polygons: vec![], op: Some((op, children)) })
     }
 
     fn bbox_in_coverage_srs(&self, bbox: BBox, srs: &Srs) -> Result<BBox> {
@@ -115,6 +159,14 @@ impl Coverage {
 
     /// `Coverage.intersects(bbox, srs)` (shapely semantics: touching counts).
     pub fn intersects(&self, bbox: BBox, srs: &Srs) -> Result<bool> {
+        if let Some((op, cs)) = &self.op {
+            return Ok(match op {
+                Op::Union => any(cs, |c| c.intersects(bbox, srs))?,
+                Op::Intersection => all(cs, |c| c.intersects(bbox, srs))?,
+                // DiffCoverage: in the first, not completely inside any of the others.
+                Op::Difference => cs[0].intersects(bbox, srs)? && !any(&cs[1..], |c| c.contains(bbox, srs))?,
+            });
+        }
         let b = self.bbox_in_coverage_srs(bbox, srs)?;
         if self.polygons.is_empty() {
             // BBOXCoverage: strict, touching does not count.
@@ -127,6 +179,13 @@ impl Coverage {
 
     /// `Coverage.contains(bbox, srs)`: the bbox lies completely inside the coverage.
     pub fn contains(&self, bbox: BBox, srs: &Srs) -> Result<bool> {
+        if let Some((op, cs)) = &self.op {
+            return Ok(match op {
+                Op::Union => any(cs, |c| c.contains(bbox, srs))?,
+                Op::Intersection => all(cs, |c| c.contains(bbox, srs))?,
+                Op::Difference => cs[0].contains(bbox, srs)? && !any(&cs[1..], |c| c.intersects(bbox, srs))?,
+            });
+        }
         let b = self.bbox_in_coverage_srs(bbox, srs)?;
         if self.polygons.is_empty() {
             return Ok(bbox_contains(self.bbox, b));
@@ -155,6 +214,24 @@ impl Coverage {
     pub fn extent_bbox_for(&self, srs: &Srs) -> Result<BBox> {
         self.srs.transform_bbox(srs, self.bbox)
     }
+}
+
+fn any(cs: &[Coverage], f: impl Fn(&Coverage) -> Result<bool>) -> Result<bool> {
+    for c in cs {
+        if f(c)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn all(cs: &[Coverage], f: impl Fn(&Coverage) -> Result<bool>) -> Result<bool> {
+    for c in cs {
+        if !f(c)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn parse_bbox(v: &Value) -> Result<BBox> {
@@ -244,6 +321,37 @@ fn polygon_intersects_rect(p: &[Ring], r: BBox) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn union_intersection_difference() {
+        let y: Value = serde_yaml::from_str(
+            "a: {bbox: [0, 0, 10, 10], srs: 'EPSG:3857'}\n\
+             b: {bbox: [5, 5, 20, 20], srs: 'EPSG:3857'}\n",
+        )
+        .unwrap();
+        let none = |_: &str| PathBuf::new();
+        let mk = |op: &str| {
+            let v: Value = serde_yaml::from_str(&format!("{op}: [{}, {}]", serde_json::to_string(&y["a"]).unwrap(), serde_json::to_string(&y["b"]).unwrap())).unwrap();
+            Coverage::from_conf(&v, &none).unwrap()
+        };
+        let srs = Srs::new("EPSG:3857").unwrap();
+        let (u, i, d) = (mk("union"), mk("intersection"), mk("difference"));
+        assert_eq!(u.bbox, [0.0, 0.0, 20.0, 20.0]);
+        assert_eq!(i.bbox, [5.0, 5.0, 10.0, 10.0]);
+        assert_eq!(d.bbox, [0.0, 0.0, 10.0, 10.0]);
+        let r = |x0: f64, y0: f64, x1: f64, y1: f64| [x0, y0, x1, y1];
+        assert!(u.intersects(r(15.0, 15.0, 16.0, 16.0), &srs).unwrap());
+        assert!(!i.intersects(r(1.0, 1.0, 2.0, 2.0), &srs).unwrap());
+        assert!(i.contains(r(6.0, 6.0, 7.0, 7.0), &srs).unwrap());
+        // difference: a minus b. Inside b only → out; straddling b's edge → intersects, not contained.
+        assert!(!d.intersects(r(6.0, 6.0, 7.0, 7.0), &srs).unwrap());
+        assert!(d.intersects(r(4.0, 4.0, 6.0, 6.0), &srs).unwrap());
+        assert!(!d.contains(r(4.0, 4.0, 6.0, 6.0), &srs).unwrap());
+        assert!(d.contains(r(1.0, 1.0, 2.0, 2.0), &srs).unwrap());
+        // transform keeps the operator.
+        let t = d.transform_to(&Srs::new("EPSG:4326").unwrap()).unwrap();
+        assert!(!t.intersects(r(6.0, 6.0, 7.0, 7.0), &srs).unwrap());
+    }
 
     #[test]
     fn rect_polygon_intersection() {

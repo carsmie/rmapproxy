@@ -28,7 +28,9 @@ use tracing::{info, warn};
 
 use crate::cache::write_atomic;
 use crate::config::load_yaml_with_bases;
+use crate::coverage::Coverage;
 use crate::login::{self, Login, ct_eq};
+use crate::schedule::Schedule;
 use crate::seed::{self, Mode};
 use crate::tile::TileManager;
 use crate::work::Queue;
@@ -82,6 +84,19 @@ pub struct Admin {
     legends_last: Mutex<Option<Json>>,
     /// Seed workers by name, from their claims/heartbeats.
     workers: Mutex<HashMap<String, WorkerInfo>>,
+    /// seed.yaml `x-schedule` entries; an invalid one is listed with its error and never runs.
+    schedules: Vec<Schedule>,
+    sched_errors: Mutex<HashMap<String, String>>,
+    /// schedule.json: {name: {last_run, job_id, paused, last_error}}.
+    sched_state: Mutex<Json>,
+    /// Cache dir → (grid, home coverage in grid SRS) for the stats' inside/outside age split.
+    home: Arc<HashMap<PathBuf, HomeArea>>,
+}
+
+/// The "inside" area of the age statistics (`RMAPPROXY_ADMIN_HOME_COVERAGE`, default `norway`).
+struct HomeArea {
+    cg: Arc<crate::tile::CacheGrid>,
+    cov: Arc<Coverage>,
 }
 
 struct WorkerInfo {
@@ -287,7 +302,15 @@ impl Admin {
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         let seed_conf = load_yaml_with_bases(&opts.seed_conf)?;
         let legend_dir = std::env::var_os("MAPPROXY_LEGEND_DIR").map(PathBuf::from).unwrap_or_else(|| base.join("legend"));
-        let tasks_json = task_list(&mgr, &seed_conf, opts.seed_conf.parent().unwrap_or(Path::new(".")));
+        let seed_dir = opts.seed_conf.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let tasks_json = task_list(&mgr, &seed_conf, &seed_dir);
+        let home = home_areas(&mgr, &seed_conf, &seed_dir);
+        let schedules = Schedule::load(&seed_conf).context("seed.yaml x-schedule")?;
+        let sched_state = std::fs::read_to_string(dir.join("schedule.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str::<Json>(&t).ok())
+            .filter(|v| v.is_object())
+            .unwrap_or_else(|| json!({}));
         let admin = Arc::new(Admin {
             exe: std::env::current_exe().context("current_exe")?,
             concurrency: env_num("SEED_CONCURRENCY", 4usize).clamp(1, 64),
@@ -308,8 +331,19 @@ impl Admin {
             legends_running: AtomicBool::new(false),
             legends_last: Mutex::new(None),
             workers: Mutex::new(HashMap::new()),
+            schedules,
+            sched_errors: Mutex::new(HashMap::new()),
+            sched_state: Mutex::new(sched_state),
+            home: Arc::new(home),
         });
         admin.load_records();
+        // Validate standing jobs like a POST would (prepare has no side effects).
+        for s in &admin.schedules {
+            if let Err(e) = admin.prepare(&s.job) {
+                warn!("admin: x-schedule.{}: {e:#}", s.name);
+                admin.sched_errors.lock().insert(s.name.clone(), format!("{e:#}"));
+            }
+        }
         Ok(admin)
     }
 
@@ -602,14 +636,7 @@ impl Admin {
                     continue;
                 }
                 let mut conf = coverages.get(c).cloned().ok_or_else(|| anyhow!("{name}: ukjent dekning {c}"))?;
-                // Datasource files resolve against seed.yaml's directory, not the job's.
-                if let Some(Yaml::String(ds)) = conf.get("datasource") {
-                    let p = Path::new(ds);
-                    if ds.ends_with(".json") && !p.is_absolute() {
-                        let abs = seed_dir.join(p).to_string_lossy().into_owned();
-                        conf.as_mapping_mut().map(|m| m.insert("datasource".into(), abs.into()));
-                    }
-                }
+                absolute_datasources(&mut conf, seed_dir);
                 covs.insert(c.into(), conf);
             }
             entries.insert(name.clone().into(), Yaml::Mapping(entry));
@@ -1462,13 +1489,136 @@ impl Admin {
         }))
     }
 
+    // ── standing jobs (seed.yaml x-schedule) ────────────────────────────────
+
+    fn save_sched_state(&self, st: &Json) {
+        if let Err(e) = write_atomic(&self.dir.join("schedule.json"), st.to_string().as_bytes()) {
+            warn!("admin: schedule.json: {e:#}");
+        }
+    }
+
+    fn sched_update(&self, name: &str, f: impl FnOnce(&mut Json)) {
+        let mut st = self.sched_state.lock();
+        if !st[name].is_object() {
+            st[name] = json!({});
+        }
+        f(&mut st[name]);
+        self.save_sched_state(&st);
+    }
+
+    /// The schedule's last job, if it is still running.
+    fn sched_running(&self, name: &str) -> Option<String> {
+        let id = self.sched_state.lock()[name]["job_id"].as_str()?.to_string();
+        self.jobs.lock().iter().any(|j| j.id == id && matches!(j.state, "running" | "stopping")).then_some(id)
+    }
+
+    async fn schedule_loop(self: Arc<Self>) {
+        if self.schedules.is_empty() {
+            return;
+        }
+        // An entry seen for the first time counts from now: a deploy must not fire every job.
+        for s in &self.schedules {
+            if !self.sched_state.lock()[&s.name]["last_run"].is_string() {
+                self.sched_update(&s.name, |e| e["last_run"] = iso(SystemTime::now()).into());
+            }
+        }
+        loop {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            let now = SystemTime::now();
+            for s in &self.schedules {
+                if self.sched_errors.lock().contains_key(&s.name) {
+                    continue;
+                }
+                let (paused, last) = {
+                    let st = self.sched_state.lock();
+                    (st[&s.name]["paused"] == true, st[&s.name]["last_run"].as_str().and_then(parse_iso).unwrap_or(0.0))
+                };
+                if paused || last >= secs(s.last_due(now)) {
+                    continue;
+                }
+                if let Some(id) = self.sched_running(&s.name) {
+                    // Still at it since the last due time: skip this round rather than queue up.
+                    self.sched_update(&s.name, |e| {
+                        e["last_run"] = iso(now).into();
+                        e["last_error"] = format!("Hoppet over {}: forrige kjøring {id} pågår fortsatt.", iso(now)).into();
+                    });
+                    continue;
+                }
+                let (a, name) = (self.clone(), s.name.clone());
+                // A refused start (job slots full) stays due and is retried next minute.
+                match tokio::task::spawn_blocking(move || a.run_schedule(&name)).await {
+                    Ok(Ok(v)) => info!("admin: x-schedule.{}: {}", s.name, v["message"]),
+                    Ok(Err(e)) => warn!("admin: x-schedule.{}: {e:#}", s.name),
+                    Err(e) => warn!("admin: x-schedule.{}: {e}", s.name),
+                }
+            }
+        }
+    }
+
+    /// Start a standing job now (on schedule or from the GUI).
+    fn run_schedule(self: &Arc<Self>, name: &str) -> Result<Json> {
+        let s = self.schedules.iter().find(|s| s.name == name).ok_or_else(|| anyhow!("ukjent fast jobb {name:?}"))?;
+        if let Some(e) = self.sched_errors.lock().get(name) {
+            bail!("ugyldig i seed.yaml: {e}");
+        }
+        if let Some(id) = self.sched_running(name) {
+            bail!("forrige kjøring {id} pågår fortsatt");
+        }
+        match self.start(&s.job) {
+            Ok(v) => {
+                self.sched_update(name, |e| {
+                    e["last_run"] = iso(SystemTime::now()).into();
+                    e["job_id"] = v["id"].clone();
+                    e["last_error"] = v["warning"].clone();
+                });
+                Ok(v)
+            }
+            Err(err) => {
+                let m = format!("{}: kunne ikke starte: {err:#}", iso(SystemTime::now()));
+                self.sched_update(name, |e| e["last_error"] = m.into());
+                Err(err)
+            }
+        }
+    }
+
+    fn set_paused(&self, name: &str, paused: bool) -> Response {
+        if !self.schedules.iter().any(|s| s.name == name) {
+            return msg(StatusCode::NOT_FOUND, format!("Ukjent fast jobb {name}."));
+        }
+        self.sched_update(name, |e| e["paused"] = paused.into());
+        msg(StatusCode::OK, if paused { format!("{name} er satt på pause.") } else { format!("{name} kjører igjen etter planen.") })
+    }
+
+    fn schedules_json(&self) -> Json {
+        let now = SystemTime::now();
+        let st = self.sched_state.lock().clone();
+        let errors = self.sched_errors.lock().clone();
+        let jobs = self.jobs.lock();
+        let list: Vec<Json> = self
+            .schedules
+            .iter()
+            .map(|s| {
+                let e = &st[&s.name];
+                let job_state = e["job_id"].as_str().and_then(|id| jobs.iter().find(|j| j.id == id)).map(|j| j.state);
+                json!({
+                    "name": s.name, "title": s.title, "when": s.describe(),
+                    "next_run": iso(s.next_due(now)), "last_run": e["last_run"], "job_id": e["job_id"],
+                    "job_state": job_state, "paused": e["paused"] == true, "last_error": e["last_error"],
+                    "invalid": errors.get(&s.name), "mode": s.job["mode"],
+                    "tasks": s.job["tasks"].as_array().into_iter().flatten().filter_map(|t| t["name"].as_str()).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        json!({ "schedules": list })
+    }
+
     // ── cache statistics ────────────────────────────────────────────────────
 
     async fn stats_loop(self: Arc<Self>) {
         loop {
             self.stats.lock().scanning = true;
-            let (base, t0) = (self.base.clone(), Instant::now());
-            match tokio::task::spawn_blocking(move || scan_cache(&base)).await {
+            let (base, home, t0) = (self.base.clone(), self.home.clone(), Instant::now());
+            match tokio::task::spawn_blocking(move || scan_cache(&base, &home)).await {
                 Ok(mut v) => {
                     v["computed_at"] = iso(SystemTime::now()).into();
                     v["scan_seconds"] = t0.elapsed().as_secs().into();
@@ -1782,30 +1932,155 @@ struct Tally {
     mtime: i64,
     /// Hardlinked single-colour tiles: counted once per inode.
     links: HashMap<u64, u64>,
+    /// Tile ages inside [0] / outside [1] the home coverage (all in [0] without one).
+    age: [AgeBins; 2],
 }
 
-fn walk(dir: &Path, t: &mut Tally) {
+const AGE_DAYS: [i64; 3] = [7, 30, 90];
+
+/// Tile ages of one area: count, oldest, how many older than each of AGE_DAYS.
+#[derive(Default, Clone, Copy)]
+struct AgeBins {
+    count: u64,
+    oldest: i64,
+    older: [u64; 3],
+}
+
+impl AgeBins {
+    fn add(&mut self, t: i64, now: i64) {
+        self.count += 1;
+        if self.oldest == 0 || t < self.oldest {
+            self.oldest = t;
+        }
+        for (n, d) in self.older.iter_mut().zip(AGE_DAYS) {
+            *n += u64::from(now - t > d * 86400);
+        }
+    }
+
+    fn merge(&mut self, o: &AgeBins) {
+        if o.count == 0 {
+            return;
+        }
+        self.count += o.count;
+        if self.oldest == 0 || o.oldest < self.oldest {
+            self.oldest = o.oldest;
+        }
+        for (a, b) in self.older.iter_mut().zip(o.older) {
+            *a += b;
+        }
+    }
+
+    fn json(&self, area: &str) -> Json {
+        json!({
+            "area": area, "count": self.count,
+            "oldest": (self.oldest > 0).then(|| iso(UNIX_EPOCH + Duration::from_secs(self.oldest as u64))),
+            "older_than_days": AGE_DAYS.iter().zip(self.older).map(|(d, n)| (d.to_string(), json!(n))).collect::<serde_json::Map<_, _>>(),
+        })
+    }
+}
+
+/// What the walker knows about the home coverage at this depth of `zz/xxx/xxx/xxx/yyy/yyy/yyy.png`.
+struct WalkCtx<'a> {
+    home: Option<&'a HomeArea>,
+    z: usize,
+    now: i64,
+}
+
+/// `inside`: Some(_) once a 1000-tile block is known to be wholly inside/outside the home
+/// coverage; tiles of a block on its edge are tested one by one. Inside = tile completely in
+/// the coverage, matching what an `outside_norway` difference sweep leaves alone.
+fn walk(dir: &Path, t: &mut Tally, ctx: &WalkCtx, parts: &mut Vec<i64>, mut inside: Option<bool>) {
+    let classify = |b: crate::srs::BBox, h: &HomeArea| -> Option<bool> {
+        let srs = &h.cg.meta.grid.srs;
+        if h.cov.contains(b, srs).ok()? {
+            Some(true)
+        } else if !h.cov.intersects(b, srs).ok()? {
+            Some(false)
+        } else {
+            None
+        }
+    };
+    if let (Some(h), 5, None) = (ctx.home, parts.len(), inside) {
+        let g = &h.cg.meta.grid;
+        let x = parts[0] * 1_000_000 + parts[1] * 1000 + parts[2];
+        let y0 = parts[3] * 1_000_000 + parts[4] * 1000;
+        let (a, b) = (g.tile_bbox((x, y0, ctx.z)), g.tile_bbox((x, y0 + 999, ctx.z)));
+        inside = classify([a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])], h);
+    }
+    let mut dir_mtime: Option<Option<i64>> = None;
     for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        if e.file_name().as_encoded_bytes().first() == Some(&b'.') {
+        let name = e.file_name();
+        if name.as_encoded_bytes().first() == Some(&b'.') {
             continue;
         }
+        let num = name.to_string_lossy().trim_end_matches(".png").parse::<i64>().ok();
         let Ok(ft) = e.file_type() else { continue };
         if ft.is_dir() {
-            walk(&e.path(), t);
+            match num {
+                Some(v) if parts.len() < 5 => {
+                    parts.push(v);
+                    walk(&e.path(), t, ctx, parts, inside);
+                    parts.pop();
+                }
+                _ => walk(&e.path(), t, ctx, &mut vec![], Some(true)),
+            }
         } else if let Ok(m) = e.metadata() {
             t.count += 1;
+            // Hardlinks carry the colour file's mtime; the dir's bounds the link time (seed.rs).
+            let mut age_t = m.mtime();
             if m.nlink() > 1 {
                 t.links.insert(m.ino(), m.len());
+                let d = *dir_mtime.get_or_insert_with(|| dir.metadata().ok().map(|d| d.mtime()));
+                age_t = age_t.max(d.unwrap_or(age_t));
             } else {
                 t.bytes += m.len();
             }
             t.mtime = t.mtime.max(m.mtime());
+            let is_inside = match (ctx.home, inside, num) {
+                (None, ..) => true,
+                (_, Some(i), _) => i,
+                (Some(h), None, Some(v)) if parts.len() == 5 => {
+                    let x = parts[0] * 1_000_000 + parts[1] * 1000 + parts[2];
+                    let y = parts[3] * 1_000_000 + parts[4] * 1000 + v;
+                    let b = h.cg.meta.grid.tile_bbox((x, y, ctx.z));
+                    h.cov.contains(b, &h.cg.meta.grid.srs).unwrap_or(true)
+                }
+                _ => true,
+            };
+            t.age[usize::from(!is_inside)].add(age_t, ctx.now);
         }
     }
 }
 
+/// Home coverage per cache dir, transformed into its grid's SRS once.
+fn home_areas(mgr: &TileManager, conf: &Yaml, dir: &Path) -> HashMap<PathBuf, HomeArea> {
+    let name = std::env::var("RMAPPROXY_ADMIN_HOME_COVERAGE").unwrap_or_else(|_| "norway".into());
+    let Some(c) = conf.get("coverages").and_then(|c| c.get(name.as_str())) else { return HashMap::new() };
+    let abspath = |p: &str| {
+        let p = PathBuf::from(p);
+        if p.is_absolute() { p } else { dir.join(p) }
+    };
+    let cov = match Coverage::from_conf(c, &abspath) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("admin: home coverage {name}: {e:#}");
+            return HashMap::new();
+        }
+    };
+    let mut out = HashMap::new();
+    for cg in mgr.cache_grids() {
+        match cov.transform_to(&cg.meta.grid.srs) {
+            Ok(t) => {
+                out.insert(cg.file.dir.clone(), HomeArea { cg: cg.clone(), cov: Arc::new(t) });
+            }
+            Err(e) => warn!("admin: home coverage {name} → {}: {e:#}", cg.grid),
+        }
+    }
+    out
+}
+
 /// Tiles per cache directory and level (`<base>/<cache>_<srs>/<zz>/…`), 8 directory walkers.
-fn scan_cache(base: &Path) -> Json {
+fn scan_cache(base: &Path, home: &HashMap<PathBuf, HomeArea>) -> Json {
     let mut work: Vec<(usize, String, PathBuf)> = vec![];
     let mut caches: Vec<String> = vec![];
     let mut entries: Vec<_> = std::fs::read_dir(base).into_iter().flatten().flatten().collect();
@@ -1841,7 +2116,9 @@ fn scan_cache(base: &Path) -> Json {
                 loop {
                     let Some((i, (ci, z, p))) = queue.lock().pop() else { break };
                     let mut t = Tally::default();
-                    walk(&p, &mut t);
+                    let home = p.parent().and_then(|c| home.get(c));
+                    let ctx = WalkCtx { home, z: z.parse().unwrap_or(0), now: secs(SystemTime::now()) as i64 };
+                    walk(&p, &mut t, &ctx, &mut Vec::with_capacity(6), None);
                     results.lock().push((i, ci, z, t));
                 }
             });
@@ -1855,12 +2132,20 @@ fn scan_cache(base: &Path) -> Json {
         let mut links: HashMap<u64, u64> = HashMap::new();
         let mut levels = vec![];
         let (mut count, mut bytes, mut mtime) = (0u64, 0u64, 0i64);
+        let has_home = home.contains_key(&base.join(name));
+        let age_json = |a: &[AgeBins; 2]| -> Json {
+            if has_home { json!([a[0].json("inne"), a[1].json("ute")]) } else { json!([a[0].json("alle")]) }
+        };
+        let mut cache_age = [AgeBins::default(); 2];
         for (_, _, z, t) in results.iter().filter(|r| r.1 == ci) {
             let link_bytes: u64 = t.links.iter().filter(|(ino, _)| !links.contains_key(ino)).map(|(_, b)| b).sum();
             links.extend(t.links.iter().map(|(a, b)| (*a, *b)));
+            cache_age[0].merge(&t.age[0]);
+            cache_age[1].merge(&t.age[1]);
             levels.push(json!({
                 "zoom": z.parse::<u32>().unwrap_or(0), "count": t.count, "size_bytes": t.bytes + link_bytes,
                 "last_modified": (t.mtime > 0).then(|| iso(UNIX_EPOCH + Duration::from_secs(t.mtime as u64))),
+                "age": age_json(&t.age),
             }));
             count += t.count;
             bytes += t.bytes + link_bytes;
@@ -1871,10 +2156,29 @@ fn scan_cache(base: &Path) -> Json {
         out.push(json!({
             "dir": name, "count": count, "size_bytes": bytes,
             "last_modified": (mtime > 0).then(|| iso(UNIX_EPOCH + Duration::from_secs(mtime as u64))),
+            "age": age_json(&cache_age),
             "zoom_levels": levels,
         }));
     }
     json!({ "caches": out, "tile_count": all_tiles, "cache_size_bytes": all_bytes })
+}
+
+/// Datasource files resolve against seed.yaml's directory, not the job's; also inside
+/// union/intersection/difference.
+fn absolute_datasources(conf: &mut Yaml, seed_dir: &Path) {
+    let Some(m) = conf.as_mapping_mut() else { return };
+    if let Some(Yaml::String(ds)) = m.get("datasource") {
+        let p = Path::new(ds);
+        if ds.ends_with(".json") && !p.is_absolute() {
+            let abs = seed_dir.join(p).to_string_lossy().into_owned();
+            m.insert("datasource".into(), abs.into());
+        }
+    }
+    for k in ["union", "intersection", "difference"] {
+        for c in m.get_mut(k).and_then(|l| l.as_sequence_mut()).into_iter().flatten() {
+            absolute_datasources(c, seed_dir);
+        }
+    }
 }
 
 fn disk_usage(p: &Path) -> Json {
@@ -1934,6 +2238,7 @@ fn task_list(mgr: &TileManager, conf: &Yaml, dir: &Path) -> Json {
             out.push(json!({
                 "name": name, "kind": kind, "levels_from": lf, "levels_to": lt, "caches": caches, "grids": grids,
                 "bbox": bbox, "refresh_before": s.get("refresh_before").is_some(), "cutoff": cutoff,
+                "coverage": covs.first(),
             }));
         }
     }
@@ -1948,6 +2253,8 @@ pub fn router(admin: Arc<Admin>) -> Router {
         tokio::spawn(a.stats_loop());
         let a = admin.clone();
         tokio::spawn(a.generate_legends(false));
+        let a = admin.clone();
+        tokio::spawn(a.schedule_loop());
     }
     match &admin.opts.login {
         None => warn!("admin: RMAPPROXY_ADMIN_PASSWORD is not set, /_admin is open"),
@@ -1976,6 +2283,10 @@ pub fn router(admin: Arc<Admin>) -> Router {
         .route("/_admin/work/complete", post(work_complete))
         .route("/_admin/work/release", post(work_release))
         .route("/_admin/stats/refresh", post(stats_refresh))
+        .route("/_admin/schedules", get(|State(a): State<Arc<Admin>>| async move { resp(StatusCode::OK, a.schedules_json()) }))
+        .route("/_admin/schedules/{name}/run", post(schedule_run))
+        .route("/_admin/schedules/{name}/pause", post(|State(a): State<Arc<Admin>>, UrlPath(n): UrlPath<String>| async move { a.set_paused(&n, true) }))
+        .route("/_admin/schedules/{name}/resume", post(|State(a): State<Arc<Admin>>, UrlPath(n): UrlPath<String>| async move { a.set_paused(&n, false) }))
         .route("/_admin/legends", post(legends))
         .route("/_admin/{file}", get(asset))
         .route("/_admin/login", get(login_page).post(login_submit))
@@ -2174,6 +2485,14 @@ async fn work_release(State(a): State<Arc<Admin>>, body: Bytes) -> Response {
     }
 }
 
+async fn schedule_run(State(a): State<Arc<Admin>>, UrlPath(name): UrlPath<String>) -> Response {
+    match tokio::task::spawn_blocking(move || a.run_schedule(&name)).await {
+        Ok(Ok(v)) => resp(StatusCode::OK, v),
+        Ok(Err(e)) => msg(StatusCode::CONFLICT, format!("Kunne ikke starte: {e:#}")),
+        Err(e) => msg(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
 async fn stats_refresh(State(a): State<Arc<Admin>>) -> Response {
     a.stats_kick.notify_one();
     msg(StatusCode::OK, "Ny opptelling startet.")
@@ -2190,6 +2509,57 @@ async fn legends(State(a): State<Arc<Admin>>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Age split over the sweep fixture: home = the box; hardlinks aged by their directory.
+    #[test]
+    fn scan_splits_tile_ages_inside_and_outside_home() {
+        let f = crate::e2e_tests::SweepFixture::new("scan");
+        let mgr = f.mgr();
+        let mut conf = load_yaml_with_bases(&f.dir.join("seed.yaml")).unwrap();
+        let bx = conf["coverages"]["box"].clone();
+        conf["coverages"].as_mapping_mut().unwrap().insert("norway".into(), bx);
+        let home = home_areas(&mgr, &conf, &f.dir);
+        assert_eq!(home.len(), 1);
+        let v = scan_cache(&f.dir.join("cache"), &home);
+        let c = &v["caches"][0];
+        let z7 = c["zoom_levels"].as_array().unwrap().iter().find(|l| l["zoom"] == 7).unwrap();
+        assert_eq!(z7["age"][0]["area"], "inne");
+        assert_eq!(z7["age"][0]["count"], 1);
+        assert_eq!(z7["age"][0]["older_than_days"]["7"], 1);
+        assert_eq!(z7["age"][1]["area"], "ute");
+        assert_eq!(z7["age"][1]["count"], 4);
+        // old_out + link_quiet; link_busy's dir is fresh.
+        assert_eq!(z7["age"][1]["older_than_days"]["7"], 2);
+        assert_eq!(z7["age"][1]["older_than_days"]["30"], 0);
+        assert_eq!(c["age"][1]["count"], 5);
+    }
+
+    /// x-schedule: valid entries list with their next run, an unknown task is flagged, pause sticks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn schedules_validate_list_and_pause() {
+        let f = crate::e2e_tests::SweepFixture::new("sched");
+        let seed = f.dir.join("seed.yaml");
+        let mut text = std::fs::read_to_string(&seed).unwrap();
+        text.push_str(
+            "x-schedule:\n  ukentlig: {title: Ukentlig, weekday: sun, at: '01:00', job: {mode: cleanup, refresh: default, tasks: [{name: sweep}]}}\n  \
+             feil: {at: '02:00', job: {mode: cleanup, tasks: [{name: finnes_ikke}]}}\n",
+        );
+        std::fs::write(&seed, text).unwrap();
+        let opts = AdminOpts { mapproxy_conf: f.dir.join("mapproxy.yaml"), seed_conf: seed, assets: f.dir.clone(), login: None };
+        let a = Admin::new(f.mgr(), opts).unwrap();
+        let v = a.schedules_json();
+        let l = v["schedules"].as_array().unwrap();
+        assert_eq!(l[0]["name"], "ukentlig");
+        assert_eq!(l[0]["when"], "hver søndag 01:00 UTC");
+        assert!(l[0]["invalid"].is_null(), "{v}");
+        assert!(l[0]["next_run"].as_str().unwrap().ends_with("T01:00:00Z"));
+        assert!(l[1]["invalid"].as_str().unwrap().contains("finnes_ikke"), "{v}");
+        assert!(a.run_schedule("feil").is_err());
+        a.set_paused("ukentlig", true);
+        assert_eq!(a.schedules_json()["schedules"][0]["paused"], true);
+        let saved: Json = serde_json::from_str(&std::fs::read_to_string(a.dir.join("schedule.json")).unwrap()).unwrap();
+        assert_eq!(saved["ukentlig"]["paused"], true);
+    }
 
     #[test]
     fn iso_roundtrip() {

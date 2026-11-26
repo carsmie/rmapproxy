@@ -464,3 +464,106 @@ async fn metrics_count_tiles_and_sources_without_client_labels() {
     assert!(!text.contains("minted-path-label") && !text.contains("healthz"), "{text}");
     assert!(reqwest::get(format!("{base}/metrics")).await.unwrap().text().await.unwrap().contains("ExceptionReport"));
 }
+
+/// Sets a path's mtime (files and directories) `days_ago` days back.
+fn set_age(p: &Path, days_ago: u64) {
+    let t = std::time::SystemTime::now() - Duration::from_secs(days_ago * 86400);
+    let s = t.duration_since(std::time::UNIX_EPOCH).unwrap();
+    let ts = libc::timespec { tv_sec: s.as_secs() as libc::time_t, tv_nsec: 0 };
+    let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), [ts, ts].as_ptr(), 0) }, 0, "{}", p.display());
+}
+
+/// A cache on disk without sources: grid `g` (EPSG:3857, 16 px tiles, 8 levels; level 7 =
+/// 2048² tiles = 262k 4×4 metatiles, past seed.rs's walk threshold; level 1 is planned), coverage `box` and
+/// `outside` = difference(grid, box), cleanup `sweep` (outside, older than 3 days). Level 7:
+/// `old_out` (2000,2000) 10 d, `old_in` (100,30, inside box) 10 d, `new_out` (2000,2001) fresh,
+/// `link_quiet` (1500,1500) hardlink to a 10-day-old colour file in a 10-day-old dir,
+/// `link_busy` (1600,1600) the same link in a fresh dir. Level 1: `l1_old_out` (31,31) 10 d.
+pub(crate) struct SweepFixture {
+    pub dir: PathBuf,
+    pub cache: PathBuf,
+}
+
+impl SweepFixture {
+    pub fn new(name: &str) -> SweepFixture {
+        let dir = std::env::temp_dir().join(format!("rmapproxy-sweep-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("mapproxy.yaml"),
+            "globals:\n  cache: {base_dir: ./cache}\n\
+             services:\n  wms: {}\n\
+             grids:\n  g: {srs: 'EPSG:3857', origin: nw, bbox: [0, 0, 1048576, 1048576], tile_size: [16, 16], \
+             res: [4096, 2048, 1024, 512, 256, 128, 64, 32]}\n\
+             caches:\n  c: {grids: [g], sources: [s1], meta_size: [4, 4], meta_buffer: 0}\n\
+             sources:\n  s1: {type: wms, req: {url: 'http://127.0.0.1:9/', layers: a, transparent: true}}\n\
+             layers:\n  - {name: l, title: L, sources: [c]}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("seed.yaml"),
+            "coverages:\n  box: {bbox: [10000, 927504, 252144, 1038576], srs: 'EPSG:3857'}\n  \
+             outside:\n    difference:\n      - {bbox: [0, 0, 1048576, 1048576], srs: 'EPSG:3857'}\n      \
+             - {bbox: [10000, 927504, 252144, 1038576], srs: 'EPSG:3857'}\n\
+             cleanups:\n  sweep: {caches: [c], coverages: [outside], remove_before: {days: 3}}\n",
+        )
+        .unwrap();
+        let cache = dir.join("cache/c_EPSG3857");
+        let fc = crate::cache::FileCache::new(cache.clone(), dir.join("locks"), 1.0, true);
+        let put = |c: crate::grid::TileCoord, days: u64| {
+            let p = fc.tile_path(c);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, b"png").unwrap();
+            set_age(&p, days);
+        };
+        put((2000, 2000, 7), 10);
+        put((100, 30, 7), 10);
+        put((2000, 2001, 7), 0);
+        put((31, 31, 1), 10);
+        let colour = cache.join("single_color_tiles/0000ffff.png");
+        std::fs::create_dir_all(colour.parent().unwrap()).unwrap();
+        std::fs::write(&colour, b"png").unwrap();
+        set_age(&colour, 10);
+        for c in [(1500, 1500, 7), (1600, 1600, 7)] {
+            let p = fc.tile_path(c);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::hard_link(&colour, &p).unwrap();
+        }
+        set_age(fc.tile_path((1500, 1500, 7)).parent().unwrap(), 10);
+        SweepFixture { dir, cache }
+    }
+
+    pub fn exists(&self, c: crate::grid::TileCoord) -> bool {
+        crate::cache::FileCache::new(self.cache.clone(), self.dir.join("locks"), 1.0, true).tile_path(c).exists()
+    }
+
+    pub fn mgr(&self) -> Arc<TileManager> {
+        let cfg = Config::load(&self.dir.join("mapproxy.yaml")).unwrap();
+        Arc::new(TileManager::with_max_renders(Arc::new(cfg), 0).unwrap())
+    }
+}
+
+impl Drop for SweepFixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// difference coverage sweep: level 7 by walking files, level 1 by planning; old tiles outside
+/// the box go, the inside one and fresh ones stay; a hardlink is aged by its directory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn outside_sweep_walks_files_and_ages_hardlinks_by_dir() {
+    let f = SweepFixture::new("outside");
+    let mgr = f.mgr();
+    let conf = crate::config::load_yaml_with_bases(&f.dir.join("seed.yaml")).unwrap();
+    let tasks = crate::seed::load_tasks_from(&mgr, &conf, &f.dir, &["sweep".into()], crate::seed::Mode::Cleanup).unwrap();
+    crate::seed::run(mgr, tasks, crate::seed::Mode::Cleanup, 2, None).await.unwrap();
+    assert!(!f.exists((2000, 2000, 7)), "old tile outside");
+    assert!(f.exists((100, 30, 7)), "old tile inside the box");
+    assert!(f.exists((2000, 2001, 7)), "fresh tile outside");
+    assert!(!f.exists((1500, 1500, 7)), "hardlink in a quiet dir");
+    assert!(f.exists((1600, 1600, 7)), "hardlink in a fresh dir");
+    assert!(!f.exists((31, 31, 1)), "planned level");
+    assert!(f.cache.join("single_color_tiles/0000ffff.png").exists());
+}

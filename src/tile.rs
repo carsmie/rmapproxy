@@ -145,6 +145,11 @@ impl TileManager {
         self.caches.get(&(cache.to_string(), grid.to_string())).cloned()
     }
 
+    /// Every cache × grid (the admin maps cache directories back to their grid).
+    pub fn cache_grids(&self) -> impl Iterator<Item = &Arc<CacheGrid>> {
+        self.caches.values()
+    }
+
     /// A tile from the cache, created (with its whole metatile) if missing.
     pub async fn tile(&self, cg: &Arc<CacheGrid>, coord: TileCoord) -> Result<Tile> {
         if !cg.meta.grid.contains(coord) {

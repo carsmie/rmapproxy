@@ -14,6 +14,7 @@ mod metrics;
 mod pickle;
 mod pyfloat;
 mod quantize;
+mod schedule;
 mod seed;
 mod server;
 mod source;

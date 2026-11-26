@@ -49,13 +49,16 @@ with exact fast paths, tiles are encoded in parallel. Source responses stay enco
 their turn in the merge, so memory stays at about one decoded layer per metatile.
 
 Done: config subset (base includes, merge keys, grids incl. `base:`), grid/metatile
-geometry, coverages (bbox + GeoJSON polygons, strict/shapely intersect semantics),
+geometry, coverages (bbox + GeoJSON polygons, strict/shapely intersect semantics, MapProxy's
+`union`/`intersection`/`difference` of inline coverages),
 resolution ranges, coverage sub-requests, `on_error` transparent/uncached, Pillow-exact
 merge, Pillow's median-cut quantizer (Quant.c port, incl. MapProxy's 1-bit alpha handling),
 `tc` file cache with atomic writes, single-colour hardlinks and MapProxy-compatible flock
 files, WMTS GetTile KVP + REST + GetCapabilities, CORS/cache headers, seeding (TileWalker
 order, coverage, levels, refresh_before / overwrite-all, `-c`), `--cleanup` (incl. complete
-extent), `--progress-file` (pickle readable by tnt-mapproxy's admin) + `--continue`. Invoked
+extent; a level whose coverage extent has >20k metatiles is cleaned by walking the files that exist,
+skipping 1000-tile dirs that miss the coverage, so `difference: [grid, norway]` sweeps stay cheap;
+single-colour hardlinks are aged by their dir's mtime, not the colour file's), `--progress-file` (pickle readable by tnt-mapproxy's admin) + `--continue`. Invoked
 as `mapproxy-seed` it behaves as the seed command. Static musl `Dockerfile` (rustls).
 `serve --admin [--seed-conf seed.yaml] [--admin-assets DIR]` adds the cache-admin API on
 `/_admin/*` (`src/admin.rs`: seed/cleanup jobs as child processes with stop/continue, estimates,
@@ -71,6 +74,12 @@ seed.yaml task with the same caches. `POST /_admin/jobs` with `mode: "refresh"` 
 seed job (`distributed: true` sends it to the workers) and one cleanup job in the admin pod, both
 validated before either starts; `GET /_admin/orders/{id}` gives their combined state. Levels are
 each grid's own (webmercator z is ~1.6 coarser than UTM z at 65°N); use a task per grid to differ.
+Standing jobs: seed.yaml `x-schedule: {<name>: {title, weekday?, at: 'HH:MM' UTC, job: <POST body>}}`
+(inert for mapproxy-seed) run from the admin, validated at startup; state in
+`.rmapproxy-admin/schedule.json`; `GET /_admin/schedules`, `POST /_admin/schedules/{name}/run|pause|resume`.
+A new entry first runs at its next due time; a run still going at the next due time skips it.
+Cache statistics include tile ages per level (oldest, older than 7/30/90 days) inside/outside the
+seed.yaml coverage `RMAPPROXY_ADMIN_HOME_COVERAGE` (default `norway`; outside = not wholly inside).
 
 2026-10-26, against MapProxy 7.0 with a deterministic fake WMS (RGBA, paletted+tRNS, opaque
 RGB, polygon coverage sub-queries):
@@ -92,7 +101,7 @@ change tiles relative to MapProxy.
    `qgis_*_cache` caches were removed): written as RGBA with a warning.
 2. WMS GetFeatureInfo / GetLegendGraphic / `tiled=true` (WMS-C); JPEG is encoded with
    `jpeg-encoder` (not byte-identical to Pillow's libjpeg); the `/demo` UI.
-3. Seeding: `refresh_before.time/mtime`, multiple coverages per task.
+3. Seeding: multiple coverages per task (use `union`).
 
 Deployment: [kartverket/tnt-rmapproxy](https://github.com/kartverket/tnt-rmapproxy) builds a
 pinned commit of this repository with tnt-mapproxy's configuration.

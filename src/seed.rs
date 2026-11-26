@@ -267,6 +267,20 @@ fn needs_work(task: &SeedTask, main: TileCoord) -> bool {
         .any(|t| task.cg.file.mtime(t).is_none_or(|m| m < before))
 }
 
+/// Age of a tile file for cleanups. A single-colour hardlink (nlink > 1) has the colour file's
+/// mtime (often months old), so an age sweep would delete every sea tile on every run; creating
+/// the link touched its directory, so the dir's mtime (taken before this sweep deleted anything
+/// there) bounds the link time from above. Stale links survive at most until the dir goes quiet.
+fn tile_age(m: &std::fs::Metadata, dir_mtime: impl FnOnce() -> Option<SystemTime>) -> Option<SystemTime> {
+    use std::os::unix::fs::MetadataExt;
+    let own = m.modified().ok()?;
+    if m.nlink() > 1 { dir_mtime().map(|d| d.max(own)) } else { Some(own) }
+}
+
+fn mtime_of(p: &Path) -> Option<SystemTime> {
+    p.metadata().and_then(|m| m.modified()).ok()
+}
+
 /// Cleanup of one metatile: remove its tiles (all, or those older than the cutoff).
 fn cleanup_meta(task: &SeedTask, main: TileCoord) -> Result<usize> {
     let mut n = 0;
@@ -274,7 +288,11 @@ fn cleanup_meta(task: &SeedTask, main: TileCoord) -> Result<usize> {
         let p = task.cg.file.tile_path(t);
         let old = match task.before {
             None => p.symlink_metadata().is_ok(),
-            Some(b) => p.symlink_metadata().and_then(|m| m.modified()).is_ok_and(|m| m < b),
+            Some(b) => p
+                .symlink_metadata()
+                .ok()
+                .and_then(|m| tile_age(&m, || p.parent().and_then(mtime_of)))
+                .is_some_and(|m| m < b),
         };
         if old && std::fs::remove_file(&p).is_ok() {
             n += 1;
@@ -373,15 +391,84 @@ fn count_files(dir: &Path) -> usize {
 
 fn remove_older(dir: &Path, before: SystemTime) -> Result<usize> {
     let mut n = 0;
+    let dir_mtime = mtime_of(dir);
     for e in std::fs::read_dir(dir)?.flatten() {
         let p = e.path();
         if p.is_dir() {
             n += remove_older(&p, before)?;
-        } else if e.metadata().and_then(|m| m.modified()).is_ok_and(|m| m < before) && std::fs::remove_file(&p).is_ok() {
+        } else if e.metadata().ok().and_then(|m| tile_age(&m, || dir_mtime)).is_some_and(|m| m < before)
+            && std::fs::remove_file(&p).is_ok()
+        {
             n += 1;
         }
     }
     Ok(n)
+}
+
+/// A cleanup level whose coverage extent holds more metatiles than this is cleaned by walking
+/// the files that exist instead of planning every metatile (16 stat()s each): an "outside
+/// Norway" difference spans the whole grid, where z14+ would mean billions of stat()s on a mostly
+/// empty cache. Small area deletes (a city at z16) stay under it and keep the planner.
+const WALK_FILES_ABOVE: i64 = 20_000;
+
+fn walk_level(task: &SeedTask, z: usize) -> bool {
+    level_meta_range(task, z).ok().flatten().is_some_and(|(x0, x1, y0, y1)| (x1 - x0 + 1) * (y1 - y0 + 1) > WALK_FILES_ABOVE)
+}
+
+/// Cleanup of level `z` by walking `<cache>/<z>/xxx/xxx/xxx/yyy/yyy/yyy.png`: remove tiles
+/// (older than the cutoff) whose bbox touches the coverage. A dir of 1000 tiles of one column
+/// whose extent misses the coverage is skipped unread.
+fn cleanup_walk(task: &SeedTask, z: usize) -> Result<usize> {
+    let dir = task.cg.file.dir.join(format!("{z:02}"));
+    if !dir.exists() {
+        return Ok(0);
+    }
+    let mut n = 0;
+    walk_tc(task, z, &dir, &mut Vec::with_capacity(6), &mut n)?;
+    Ok(n)
+}
+
+fn walk_tc(task: &SeedTask, z: usize, dir: &Path, parts: &mut Vec<i64>, n: &mut usize) -> Result<()> {
+    let g = &task.cg.meta.grid;
+    let touches = |b: BBox| match &task.coverage {
+        Some(c) => c.intersects(b, &g.srs),
+        None => Ok(true),
+    };
+    if parts.len() == 5 {
+        // x known, y = parts[3..5] * 1000 + 0..999: test the block's extent once.
+        let x = parts[0] * 1_000_000 + parts[1] * 1000 + parts[2];
+        let y0 = parts[3] * 1_000_000 + parts[4] * 1000;
+        let (a, b) = (g.tile_bbox((x, y0, z)), g.tile_bbox((x, y0 + 999, z)));
+        if !touches([a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])])? {
+            return Ok(());
+        }
+    }
+    let dir_mtime = mtime_of(dir);
+    for e in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))?.flatten() {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        let Ok(v) = name.trim_end_matches(".png").parse::<i64>() else { continue };
+        if parts.len() < 5 {
+            parts.push(v);
+            let r = walk_tc(task, z, &e.path(), parts, n);
+            parts.pop();
+            r?;
+            continue;
+        }
+        let x = parts[0] * 1_000_000 + parts[1] * 1000 + parts[2];
+        let y = parts[3] * 1_000_000 + parts[4] * 1000 + v;
+        if !touches(g.tile_bbox((x, y, z)))? {
+            continue;
+        }
+        let old = match task.before {
+            None => true,
+            Some(b) => e.metadata().ok().and_then(|m| tile_age(&m, || dir_mtime)).is_some_and(|m| m < b),
+        };
+        if old && std::fs::remove_file(e.path()).is_ok() {
+            *n += 1;
+        }
+    }
+    Ok(())
 }
 
 /// `--progress-file`: the pickle tnt-mapproxy's admin reads (task-id keys) plus a JSON
@@ -546,6 +633,21 @@ pub async fn run(mgr: Arc<TileManager>, tasks: Vec<SeedTask>, mode: Mode, concur
             println!("    removed {n} tiles");
             continue;
         }
+        // Cleanup levels too large to plan: walk the existing files, then plan the rest.
+        let task = if seeding {
+            task
+        } else {
+            let (walk, plan_levels): (Vec<usize>, Vec<usize>) = task.levels.iter().partition(|&&z| walk_level(&task, z));
+            for &z in &walk {
+                let t0 = Instant::now();
+                let n = tokio::task::block_in_place(|| cleanup_walk(&task, z))?;
+                println!("[{}] {z:2} walked existing files: {n} tiles removed in {:.1} s", clock(), t0.elapsed().as_secs_f64());
+            }
+            if plan_levels.is_empty() {
+                continue;
+            }
+            SeedTask { levels: plan_levels, ..task }
+        };
 
         let metas = plan(&task)?;
         let total = metas.len();
