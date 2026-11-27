@@ -231,8 +231,10 @@ impl TileManager {
                 SourceImage::Decoded(img, mode) => merger.add(img, mode),
                 SourceImage::Png { data, size: sub, place } => {
                     // Decode + composite on this worker without stalling the runtime.
+                    let t = std::time::Instant::now();
                     tokio::task::block_in_place(|| merger.add_png(&data, sub, place))
                         .with_context(|| format!("source {}", s.conf.name))?;
+                    crate::metrics::stage("decode_merge", t.elapsed());
                 }
             }
         }
@@ -241,11 +243,13 @@ impl TileManager {
         let tiles: Vec<(TileCoord, (u32, u32))> = meta.tiles.iter().filter_map(|(c, off)| c.map(|c| (c, *off))).collect();
         let image = cg.image.clone();
         let encoded = tokio::task::spawn_blocking(move || -> Result<Vec<EncodedTile>> {
+            let t = std::time::Instant::now();
             let merged = merger.finish();
             let parts: Vec<_> = tiles
                 .iter()
                 .map(|&(c, (x, y))| (c, merged.crop(x, y, tile_size.0, tile_size.1)))
                 .collect();
+            crate::metrics::stage("finish", t.elapsed());
             std::thread::scope(|s| {
                 let handles: Vec<_> = parts
                     .iter()
@@ -262,9 +266,11 @@ impl TileManager {
             let cg2 = cg.clone();
             let to_store: Vec<_> = encoded.iter().map(|(c, d, sc)| (*c, d.clone(), *sc)).collect();
             tokio::task::spawn_blocking(move || -> Result<()> {
+                let t = std::time::Instant::now();
                 for (c, d, sc) in to_store {
                     cg2.file.store(c, &d, sc)?;
                 }
+                crate::metrics::stage("store", t.elapsed());
                 Ok(())
             })
             .await??;
@@ -373,12 +379,20 @@ fn encode(img: &Rgba, opts: &ImageOpts) -> Result<Vec<u8>> {
             _ => None,
         };
         if let Some(q) = quant {
+            let t = std::time::Instant::now();
             let (pal, idx) = q(img, colors);
-            return crate::image::encode_png_paletted(img.w, img.h, &pal, &idx, true, crate::image::PNG_TILE);
+            crate::metrics::stage("quantize", t.elapsed());
+            let t = std::time::Instant::now();
+            let png = crate::image::encode_png_paletted(img.w, img.h, &pal, &idx, true, crate::image::PNG_TILE);
+            crate::metrics::stage("png_encode", t.elapsed());
+            return png;
         }
         // TODO(parity): Pillow's fastoctree (the default quantizer).
         static WARNED: std::sync::Once = std::sync::Once::new();
         WARNED.call_once(|| warn!("image.colors with the fastoctree quantizer is not implemented; writing RGBA"));
     }
-    encode_png_rgba(img, crate::image::PNG_TILE)
+    let t = std::time::Instant::now();
+    let png = encode_png_rgba(img, crate::image::PNG_TILE);
+    crate::metrics::stage("png_encode", t.elapsed());
+    png
 }

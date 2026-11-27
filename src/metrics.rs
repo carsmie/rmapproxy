@@ -63,6 +63,17 @@ static SOURCE_BYTES: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!("rmapproxy_source_bytes_total", "Image bytes received from sources", &["source"]).expect("static metric")
 });
 
+// Microsecond counters per pipeline stage (decode+composite, quantize, PNG encode, store):
+// divided by rmapproxy_metatiles_total they give the CPU split of a metatile render.
+static STAGE_MICROS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!("rmapproxy_stage_microseconds_total", "Time in each metatile render stage", &["stage"]).expect("static metric")
+});
+
+/// Adds `took` to a render stage (decode_merge, finish, quantize, png_encode, store).
+pub fn stage(stage: &str, took: Duration) {
+    STAGE_MICROS.with_label_values(&[stage]).inc_by(took.as_micros() as u64);
+}
+
 pub fn http_request(route: &str, status: u16, took: Duration) {
     HTTP_REQUESTS.with_label_values(&[route, status.to_string().as_str()]).inc();
     HTTP_SECONDS.with_label_values(&[route]).observe(took.as_secs_f64());
