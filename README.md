@@ -24,6 +24,10 @@ source URL and per-metatile timings.
 demand at once; requests for tiles of a metatile already being rendered wait for it.
 `RMAPPROXY_METRICS_ADDR` (default off) serves Prometheus `GET /metrics` from `serve` and
 `seed-worker` on its own port, so metrics stay off the public service port.
+`RMAPPROXY_AFFINITY_HEADER` (default off) adds `<header>: <source>|<cx>|<cy>` to every source
+GetMap, the bbox centre in `RMAPPROXY_AFFINITY_CELL_M` cells (default 5000 m). A mesh that hashes
+on it (Istio `consistentHash.httpHeaderName`) sends one layer's requests for one area to the same
+backend pod, keeping its data caches warm, while a layer still spreads over many pods.
 `/_admin` sends no CORS headers and refuses non-GET requests from other sites. With
 `RMAPPROXY_WORKER_TOKEN` set on the admin and the workers, `/_admin/work/*` requires it as a
 bearer token. `RMAPPROXY_ADMIN_PASSWORD` (default unset: open) puts a login in front of the GUI and

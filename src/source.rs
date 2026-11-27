@@ -12,6 +12,37 @@ use crate::pyfloat::int;
 use crate::srs::{BBox, Srs};
 use crate::transform::{mesh_warp, transform_meshes};
 
+/// Optional backend affinity: with RMAPPROXY_AFFINITY_HEADER set, every GetMap carries
+/// `<header>: <source>|<cx>|<cy>`, the bbox centre in RMAPPROXY_AFFINITY_CELL_M cells (default
+/// 5000 m). A mesh hashing on it (Istio consistentHash.httpHeaderName) sends the same layer and
+/// area to the same backend pod, which keeps that pod's data caches warm; one layer still
+/// spreads over many pods. Unset (default): no header.
+struct Affinity {
+    header: reqwest::header::HeaderName,
+    cell_m: f64,
+}
+
+static AFFINITY: std::sync::LazyLock<Option<Affinity>> = std::sync::LazyLock::new(|| {
+    let name = std::env::var("RMAPPROXY_AFFINITY_HEADER").ok().filter(|v| !v.trim().is_empty())?;
+    let header = match reqwest::header::HeaderName::from_bytes(name.trim().as_bytes()) {
+        Ok(h) => h,
+        Err(e) => {
+            warn!("RMAPPROXY_AFFINITY_HEADER {name:?} ignored: {e}");
+            return None;
+        }
+    };
+    let cell_m = std::env::var("RMAPPROXY_AFFINITY_CELL_M").ok().and_then(|v| v.parse::<f64>().ok()).filter(|c| *c > 0.0).unwrap_or(5000.0);
+    tracing::info!("source requests carry affinity header {header} (cell {cell_m} m)");
+    Some(Affinity { header, cell_m })
+});
+
+/// `<source>|<cx>|<cy>` for the bbox centre; geographic SRS: cell converted to degrees.
+fn affinity_key(source: &str, bbox: BBox, srs: &Srs, cell_m: f64) -> String {
+    let cell = if srs.geographic { cell_m / (2.0 * std::f64::consts::PI * 6378137.0 / 360.0) } else { cell_m };
+    let (cx, cy) = ((bbox[0] + bbox[2]) / 2.0, (bbox[1] + bbox[3]) / 2.0);
+    format!("{source}|{}|{}", (cx / cell).floor() as i64, (cy / cell).floor() as i64)
+}
+
 /// What a source contributes to a merge. Responses stay encoded until merged, so a
 /// metatile holds at most one decoded source image at a time.
 pub enum SourceImage {
@@ -202,12 +233,13 @@ impl WmsSource {
     /// immediate retries hit the same dead endpoint.
     async fn request(&self, bbox: BBox, size: (u32, u32), srs: &Srs) -> Result<Vec<u8>> {
         let url = self.getmap_url(bbox, size, srs);
+        let affinity = AFFINITY.as_ref().map(|a| (&a.header, affinity_key(&self.conf.name, bbox, srs, a.cell_m)));
         debug!("source {}: {url}", self.conf.name);
         let mut backoff = RETRY_BACKOFF.iter();
         let attempted = |result, t0: std::time::Instant, bytes| crate::metrics::source_attempt(&self.conf.name, result, t0.elapsed(), bytes);
         loop {
             let t0 = std::time::Instant::now();
-            match self.request_once(&url).await {
+            match self.request_once(&url, affinity.as_ref().map(|(h, k)| (*h, k.as_str()))).await {
                 Err(Attempt::Transient(e)) => match backoff.next() {
                     Some(d) => {
                         attempted("retry", t0, 0);
@@ -231,7 +263,7 @@ impl WmsSource {
         }
     }
 
-    async fn request_once(&self, url: &str) -> std::result::Result<Vec<u8>, Attempt> {
+    async fn request_once(&self, url: &str, affinity: Option<(&reqwest::header::HeaderName, &str)>) -> std::result::Result<Vec<u8>, Attempt> {
         let name = &self.conf.name;
         // Connect/reset errors are transient, timeouts are not (the render already took
         // client_timeout; repeating it only adds load).
@@ -239,10 +271,11 @@ impl WmsSource {
             let msg = anyhow!("{name}: {e}");
             if e.is_timeout() { Attempt::Fatal(msg) } else { Attempt::Transient(msg) }
         };
-        let resp = self
-            .client
-            .get(url)
-            .timeout(Duration::from_secs_f64(self.conf.client_timeout))
+        let mut req = self.client.get(url).timeout(Duration::from_secs_f64(self.conf.client_timeout));
+        if let Some((h, k)) = affinity {
+            req = req.header(h, k);
+        }
+        let resp = req
             .send()
             .await
             .map_err(classify)?;
@@ -336,6 +369,7 @@ fn urlencode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn position_matches_mapproxy_doctests() {
@@ -359,6 +393,61 @@ mod tests {
             ),
             ((256, 237), (0, 19), [586400.0, 196400.0, 752800.0, 350000.0])
         );
+    }
+
+    /// Same layer + 5 km cell → same key; neighbours across a cell edge differ; negative
+    /// coordinates floor (not truncate); geographic bboxes use degrees.
+    #[test]
+    fn affinity_key_cells() {
+        let utm = Srs::new("EPSG:25833").unwrap();
+        let k = |b: BBox| affinity_key("lag06", b, &utm, 5000.0);
+        assert_eq!(k([261000.0, 6649000.0, 262000.0, 6650000.0]), "lag06|52|1329");
+        assert_eq!(k([262000.0, 6649000.0, 263000.0, 6650000.0]), k([261000.0, 6649000.0, 262000.0, 6650000.0]));
+        assert_ne!(k([264500.0, 6649000.0, 265500.0, 6650000.0]), k([261000.0, 6649000.0, 262000.0, 6650000.0]));
+        assert_eq!(k([-2000.0, 0.0, -1000.0, 1000.0]), "lag06|-1|0");
+        assert_ne!(affinity_key("lag08", [261000.0, 6649000.0, 262000.0, 6650000.0], &utm, 5000.0), k([261000.0, 6649000.0, 262000.0, 6650000.0]));
+        let wgs = Srs::new("EPSG:4326").unwrap();
+        // 5 km ≈ 0.0449°: 10.70° → cell 238.
+        assert_eq!(affinity_key("x", [10.69, 59.90, 10.71, 59.92], &wgs, 5000.0), "x|238|1333");
+    }
+
+    /// The affinity header goes out with the GetMap.
+    #[tokio::test]
+    async fn request_sends_affinity_header() {
+        use axum::{Router, http::HeaderMap, routing::get};
+        let seen = Arc::new(std::sync::Mutex::new(None::<String>));
+        let s2 = seen.clone();
+        let app = Router::new().route(
+            "/wms",
+            get(move |h: HeaderMap| {
+                let s2 = s2.clone();
+                async move {
+                    *s2.lock().unwrap() = h.get("x-rgis-affinity").and_then(|v| v.to_str().ok()).map(String::from);
+                    ([("content-type", "image/png")], vec![0u8; 4])
+                }
+            }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        let conf = SourceConf {
+            name: "lag06".into(),
+            url: format!("http://{addr}/wms"),
+            params: vec![],
+            supported_srs: vec![],
+            min_res: None,
+            max_res: None,
+            coverage: None,
+            on_error_transparent: false,
+            client_timeout: 5.0,
+        };
+        let src = WmsSource::new(conf, reqwest::Client::new());
+        let h = reqwest::header::HeaderName::from_static("x-rgis-affinity");
+        let body = src.request_once(&format!("http://{addr}/wms"), Some((&h, "lag06|52|1329"))).await;
+        assert!(body.is_ok());
+        assert_eq!(seen.lock().unwrap().as_deref(), Some("lag06|52|1329"));
+        src.request_once(&format!("http://{addr}/wms"), None).await.ok().unwrap();
+        assert_eq!(seen.lock().unwrap().as_deref(), None, "no header when affinity is off");
     }
 
     #[test]
