@@ -80,6 +80,11 @@ Standing jobs: seed.yaml `x-schedule: {<name>: {title, weekday?, at: 'HH:MM' UTC
 A new entry first runs at its next due time; a run still going at the next due time skips it.
 Cache statistics include tile ages per level (oldest, older than 7/30/90 days) inside/outside the
 seed.yaml coverage `RMAPPROXY_ADMIN_HOME_COVERAGE` (default `norway`; outside = not wholly inside).
+The scan (at start, every `RMAPPROXY_ADMIN_STATS_INTERVAL` s, after each job) stats every file; on
+NFS that metadata load slows seeding and serving several-fold. Automatic scans therefore wait while
+seed/cleanup jobs run (this admin's, or a progress file fresher than 15 min) and a running scan
+pauses until they finish; `POST /_admin/stats/refresh` (manual) does neither. State JSON:
+`stats_waiting`, `stats_paused`, `stats.paused_seconds`.
 
 2026-10-26, against MapProxy 7.0 with a deterministic fake WMS (RGBA, paletted+tRNS, opaque
 RGB, polygon coverage sub-queries):

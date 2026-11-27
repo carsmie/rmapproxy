@@ -10,7 +10,7 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -44,6 +44,8 @@ const LOG_LINE_MAX: usize = 2000;
 const STALL_SECS: u64 = 300;
 /// Another process's progress file written this recently: that seed is probably running.
 const EXTERNAL_FRESH_SECS: u64 = 900;
+/// How often a waiting or running cache scan re-checks for seed/cleanup jobs.
+const SCAN_CHECK: Duration = Duration::from_secs(15);
 const HISTORY_MAX: usize = 100;
 /// Finished (deleted) jobs kept in memory for the job list.
 const DONE_KEEP: usize = 20;
@@ -80,6 +82,8 @@ pub struct Admin {
     history_lock: Mutex<()>,
     stats: Mutex<Stats>,
     stats_kick: tokio::sync::Notify,
+    /// Set by POST /_admin/stats/refresh: that scan neither waits for nor pauses for jobs.
+    stats_manual: AtomicBool,
     legends_running: AtomicBool,
     legends_last: Mutex<Option<Json>>,
     /// Seed workers by name, from their claims/heartbeats.
@@ -124,6 +128,10 @@ const WORKER_SEEN_SECS: u64 = 60;
 struct Stats {
     data: Option<Json>,
     scanning: bool,
+    /// Automatic scan held back until seed/cleanup jobs are done (see `Admin::seeding_active`).
+    waiting: bool,
+    /// Running scan paused for the same reason.
+    paused: bool,
 }
 
 struct Job {
@@ -328,6 +336,7 @@ impl Admin {
             history_lock: Mutex::new(()),
             stats: Mutex::new(Stats::default()),
             stats_kick: tokio::sync::Notify::new(),
+            stats_manual: AtomicBool::new(false),
             legends_running: AtomicBool::new(false),
             legends_last: Mutex::new(None),
             workers: Mutex::new(HashMap::new()),
@@ -1614,15 +1623,69 @@ impl Admin {
 
     // ── cache statistics ────────────────────────────────────────────────────
 
+    /// Seed/cleanup work writing to the cache: this admin's jobs (in-pod or distributed) and
+    /// other processes whose progress file is fresh (SKIPJobs). The cache scan stats every
+    /// file on the same volume; on NFS that metadata load slows those writers (and tile
+    /// serving) several-fold, so automatic scans wait and running ones pause meanwhile.
+    fn seeding_active(&self) -> bool {
+        self.jobs.lock().iter().any(|j| matches!(j.state, "running" | "stopping"))
+            || self.externals().iter().any(|e| e["running"] == true)
+    }
+
     async fn stats_loop(self: Arc<Self>) {
         loop {
+            let manual = self.stats_manual.swap(false, Ordering::SeqCst);
+            if !manual && self.seeding_active() {
+                info!("admin: cache scan waits for seed/cleanup jobs");
+                self.stats.lock().waiting = true;
+                while self.seeding_active() && !self.stats_manual.load(Ordering::SeqCst) {
+                    tokio::select! {
+                        _ = tokio::time::sleep(SCAN_CHECK) => {}
+                        _ = self.stats_kick.notified() => {}
+                    }
+                }
+                self.stats.lock().waiting = false;
+                if self.stats_manual.load(Ordering::SeqCst) {
+                    continue; // manual refresh while waiting: take the manual path above
+                }
+            }
             self.stats.lock().scanning = true;
             let (base, home, t0) = (self.base.clone(), self.home.clone(), Instant::now());
-            match tokio::task::spawn_blocking(move || scan_cache(&base, &home)).await {
+            let (pause, paused) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicU64::new(0)));
+            // Watcher: pause the walk while jobs run (never for a manual scan); aborted when done.
+            let watcher = (!manual).then(|| {
+                let (a, pause, paused) = (self.clone(), pause.clone(), paused.clone());
+                tokio::spawn(async move {
+                    loop {
+                        let p = a.seeding_active();
+                        if p != pause.swap(p, Ordering::SeqCst) {
+                            info!("admin: cache scan {}", if p { "paused: seed/cleanup jobs running" } else { "resumed" });
+                        }
+                        a.stats.lock().paused = p;
+                        tokio::time::sleep(SCAN_CHECK).await;
+                        if p {
+                            paused.fetch_add(SCAN_CHECK.as_secs(), Ordering::SeqCst);
+                        }
+                    }
+                })
+            });
+            let p2 = pause.clone();
+            let res = tokio::task::spawn_blocking(move || scan_cache(&base, &home, &p2)).await;
+            if let Some(w) = watcher {
+                w.abort();
+            }
+            self.stats.lock().paused = false;
+            let paused_secs = paused.load(Ordering::SeqCst);
+            match res {
                 Ok(mut v) => {
                     v["computed_at"] = iso(SystemTime::now()).into();
                     v["scan_seconds"] = t0.elapsed().as_secs().into();
-                    info!("admin: cache scan: {} tiles in {:.0} s", v["tile_count"], t0.elapsed().as_secs_f64());
+                    v["paused_seconds"] = paused_secs.into();
+                    info!(
+                        "admin: cache scan: {} tiles in {:.0} s ({paused_secs} s paused for jobs)",
+                        v["tile_count"],
+                        t0.elapsed().as_secs_f64()
+                    );
                     self.stats.lock().data = Some(v);
                 }
                 Err(e) => warn!("admin: cache scan: {e}"),
@@ -1736,9 +1799,9 @@ impl Admin {
             .iter()
             .map(|s| (s.to_string(), json!(self.legend_dir.join(format!("topo-{s}.png")).metadata().ok().map(|m| m.len()))))
             .collect();
-        let (stats, scanning) = {
+        let (stats, scanning, waiting, paused) = {
             let s = self.stats.lock();
-            (s.data.clone(), s.scanning)
+            (s.data.clone(), s.scanning, s.waiting, s.paused)
         };
         json!({
             "instance": std::env::var("TOPO_CLUSTER").ok(),
@@ -1753,6 +1816,8 @@ impl Admin {
             "external_fresh_seconds": EXTERNAL_FRESH_SECS,
             "stats": stats,
             "stats_scanning": scanning,
+            "stats_waiting": waiting,
+            "stats_paused": paused,
             "stats_interval_seconds": self.stats_interval.as_secs(),
             "disk": disk_usage(&self.base),
             "legend_dir": self.legend_dir,
@@ -1984,12 +2049,17 @@ struct WalkCtx<'a> {
     home: Option<&'a HomeArea>,
     z: usize,
     now: i64,
+    /// Checked once per directory: while set, the walk sleeps (seed/cleanup jobs running).
+    pause: &'a AtomicBool,
 }
 
 /// `inside`: Some(_) once a 1000-tile block is known to be wholly inside/outside the home
 /// coverage; tiles of a block on its edge are tested one by one. Inside = tile completely in
 /// the coverage, matching what an `outside_norway` difference sweep leaves alone.
 fn walk(dir: &Path, t: &mut Tally, ctx: &WalkCtx, parts: &mut Vec<i64>, mut inside: Option<bool>) {
+    while ctx.pause.load(Ordering::Relaxed) {
+        std::thread::sleep(Duration::from_secs(1));
+    }
     let classify = |b: crate::srs::BBox, h: &HomeArea| -> Option<bool> {
         let srs = &h.cg.meta.grid.srs;
         if h.cov.contains(b, srs).ok()? {
@@ -2080,7 +2150,7 @@ fn home_areas(mgr: &TileManager, conf: &Yaml, dir: &Path) -> HashMap<PathBuf, Ho
 }
 
 /// Tiles per cache directory and level (`<base>/<cache>_<srs>/<zz>/…`), 8 directory walkers.
-fn scan_cache(base: &Path, home: &HashMap<PathBuf, HomeArea>) -> Json {
+fn scan_cache(base: &Path, home: &HashMap<PathBuf, HomeArea>, pause: &AtomicBool) -> Json {
     let mut work: Vec<(usize, String, PathBuf)> = vec![];
     let mut caches: Vec<String> = vec![];
     let mut entries: Vec<_> = std::fs::read_dir(base).into_iter().flatten().flatten().collect();
@@ -2117,7 +2187,7 @@ fn scan_cache(base: &Path, home: &HashMap<PathBuf, HomeArea>) -> Json {
                     let Some((i, (ci, z, p))) = queue.lock().pop() else { break };
                     let mut t = Tally::default();
                     let home = p.parent().and_then(|c| home.get(c));
-                    let ctx = WalkCtx { home, z: z.parse().unwrap_or(0), now: secs(SystemTime::now()) as i64 };
+                    let ctx = WalkCtx { home, z: z.parse().unwrap_or(0), now: secs(SystemTime::now()) as i64, pause };
                     walk(&p, &mut t, &ctx, &mut Vec::with_capacity(6), None);
                     results.lock().push((i, ci, z, t));
                 }
@@ -2494,6 +2564,7 @@ async fn schedule_run(State(a): State<Arc<Admin>>, UrlPath(name): UrlPath<String
 }
 
 async fn stats_refresh(State(a): State<Arc<Admin>>) -> Response {
+    a.stats_manual.store(true, Ordering::SeqCst);
     a.stats_kick.notify_one();
     msg(StatusCode::OK, "Ny opptelling startet.")
 }
@@ -2520,7 +2591,7 @@ mod tests {
         conf["coverages"].as_mapping_mut().unwrap().insert("norway".into(), bx);
         let home = home_areas(&mgr, &conf, &f.dir);
         assert_eq!(home.len(), 1);
-        let v = scan_cache(&f.dir.join("cache"), &home);
+        let v = scan_cache(&f.dir.join("cache"), &home, &AtomicBool::new(false));
         let c = &v["caches"][0];
         let z7 = c["zoom_levels"].as_array().unwrap().iter().find(|l| l["zoom"] == 7).unwrap();
         assert_eq!(z7["age"][0]["area"], "inne");
@@ -2559,6 +2630,82 @@ mod tests {
         assert_eq!(a.schedules_json()["schedules"][0]["paused"], true);
         let saved: Json = serde_json::from_str(&std::fs::read_to_string(a.dir.join("schedule.json")).unwrap()).unwrap();
         assert_eq!(saved["ukentlig"]["paused"], true);
+    }
+
+    /// A set pause flag holds the cache walk; clearing it lets the scan finish unchanged.
+    #[test]
+    fn scan_pauses_while_flag_set() {
+        let f = crate::e2e_tests::SweepFixture::new("scanpause");
+        let home = HashMap::new();
+        let free = scan_cache(&f.dir.join("cache"), &home, &AtomicBool::new(false));
+        let pause = Arc::new(AtomicBool::new(true));
+        let (p, dir) = (pause.clone(), f.dir.join("cache"));
+        let h = std::thread::spawn(move || scan_cache(&dir, &HashMap::new(), &p));
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(!h.is_finished(), "scan must wait while paused");
+        pause.store(false, Ordering::SeqCst);
+        let v = h.join().unwrap();
+        assert_eq!(v["tile_count"], free["tile_count"]);
+        assert!(v["tile_count"].as_u64().unwrap() > 0);
+    }
+
+    /// Jobs that write the cache make automatic scans wait: a fresh external progress file
+    /// (SKIPJob) counts; an old one doesn't.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn seeding_active_sees_fresh_external_progress() {
+        let f = crate::e2e_tests::SweepFixture::new("seedactive");
+        let opts = AdminOpts {
+            mapproxy_conf: f.dir.join("mapproxy.yaml"),
+            seed_conf: f.dir.join("seed.yaml"),
+            assets: f.dir.clone(),
+            login: None,
+        };
+        let a = Admin::new(f.mgr(), opts).unwrap();
+        assert!(!a.seeding_active());
+        let prog = a.base.join(".mapproxy_seed_progress.skipjob-test");
+        std::fs::write(&prog, b"x").unwrap();
+        assert!(a.seeding_active(), "fresh SKIPJob progress file = seeding");
+        let old = SystemTime::now() - Duration::from_secs(EXTERNAL_FRESH_SECS + 60);
+        std::fs::File::options().write(true).open(&prog).unwrap().set_modified(old).unwrap();
+        assert!(!a.seeding_active(), "stale progress file = not seeding");
+    }
+
+    /// stats_loop: an automatic scan waits while a SKIPJob's progress file is fresh and runs once
+    /// it's stale (kicked like a job end); a manual refresh scans despite a running job.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stats_loop_waits_for_jobs_but_manual_does_not() {
+        let f = crate::e2e_tests::SweepFixture::new("statsloop");
+        let opts = AdminOpts {
+            mapproxy_conf: f.dir.join("mapproxy.yaml"),
+            seed_conf: f.dir.join("seed.yaml"),
+            assets: f.dir.clone(),
+            login: None,
+        };
+        let a = Admin::new(f.mgr(), opts).unwrap();
+        let prog = a.base.join(".mapproxy_seed_progress.skipjob-test");
+        std::fs::write(&prog, b"x").unwrap();
+        // Async wait: a blocking sleep would starve stats_loop (it sits in this worker's LIFO slot).
+        async fn wait_for(a: &Arc<Admin>, step: &str, cond: impl Fn(&Stats) -> bool) {
+            let t0 = Instant::now();
+            while !cond(&a.stats.lock()) {
+                assert!(t0.elapsed() < Duration::from_secs(10), "timed out: {step}");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+        tokio::spawn(a.clone().stats_loop());
+        wait_for(&a, "waiting", |s| s.waiting).await;
+        assert!(a.stats.lock().data.is_none(), "no scan while a job writes the cache");
+        // Manual refresh: scans although the job is still "running".
+        a.stats_manual.store(true, Ordering::SeqCst);
+        a.stats_kick.notify_one();
+        wait_for(&a, "manual scan", |s| s.data.is_some() && !s.scanning).await;
+        assert_eq!(a.stats.lock().data.as_ref().unwrap()["paused_seconds"], 0);
+        // Automatic again after the job: stale progress file + kick (as when a job ends).
+        a.stats.lock().data = None;
+        let old = SystemTime::now() - Duration::from_secs(EXTERNAL_FRESH_SECS + 60);
+        std::fs::File::options().write(true).open(&prog).unwrap().set_modified(old).unwrap();
+        a.stats_kick.notify_one();
+        wait_for(&a, "automatic scan after job", |s| s.data.is_some() && !s.scanning && !s.waiting).await;
     }
 
     #[test]
