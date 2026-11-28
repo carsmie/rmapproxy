@@ -240,6 +240,10 @@ impl TileManager {
             }
         }
         let t_fetch = t0.elapsed();
+        // Wall time per metatile (not per thread), queue waits included: where a metatile's
+        // latency goes beyond the CPU stages (sources_wall + encode_wall + store_wall ≈ latency).
+        crate::metrics::stage("sources_wall", t_fetch);
+        let t_enc = std::time::Instant::now();
         let tile_size = cg.meta.grid.tile_size;
         let tiles: Vec<(TileCoord, (u32, u32))> = meta.tiles.iter().filter_map(|(c, off)| c.map(|c| (c, *off))).collect();
         let image = cg.image.clone();
@@ -263,9 +267,11 @@ impl TileManager {
             })
         })
         .await??;
+        crate::metrics::stage("encode_wall", t_enc.elapsed());
         if store && cacheable {
             let cg2 = cg.clone();
             let to_store: Vec<_> = encoded.iter().map(|(c, d, sc)| (*c, d.clone(), *sc)).collect();
+            let t_store = std::time::Instant::now();
             tokio::task::spawn_blocking(move || -> Result<()> {
                 let t = std::time::Instant::now();
                 for (c, d, sc) in to_store {
@@ -275,6 +281,7 @@ impl TileManager {
                 Ok(())
             })
             .await??;
+            crate::metrics::stage("store_wall", t_store.elapsed());
         } else if !cacheable {
             info!("metatile {:?} of {} not cached (source error)", meta.main_tile(), cg.cache);
         }

@@ -69,7 +69,8 @@ static STAGE_MICROS: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!("rmapproxy_stage_microseconds_total", "Time in each metatile render stage", &["stage"]).expect("static metric")
 });
 
-/// Adds `took` to a render stage (decode_merge, finish, quantize, png_encode, store).
+/// Adds `took` to a render stage: CPU-side (decode_merge, finish, quantize, png_encode, store;
+/// summed over threads) or per-metatile wall time incl. queueing (sources_wall, encode_wall, store_wall).
 pub fn stage(stage: &str, took: Duration) {
     STAGE_MICROS.with_label_values(&[stage]).inc_by(took.as_micros() as u64);
 }
