@@ -262,11 +262,16 @@ fn merge_row(canvas: &mut Rgba, row: &[u8], x: i64, y: i64, mode: MergeMode) {
 
 /// RGBA PNG (MapProxy's default for transparent png caches without `colors`).
 pub fn encode_png_rgba(img: &Rgba, compression: png::DeflateCompression) -> Result<Vec<u8>> {
+    encode_png_rgba_filtered(img, compression, png::Filter::Adaptive)
+}
+
+fn encode_png_rgba_filtered(img: &Rgba, compression: png::DeflateCompression, filter: png::Filter) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(img.px.len() / 4);
     {
         let mut enc = png::Encoder::new(&mut out, img.w, img.h);
         enc.set_color(png::ColorType::Rgba);
         enc.set_depth(png::BitDepth::Eight);
+        enc.set_filter(filter);
         enc.set_deflate_compression(compression);
         let mut w = enc.write_header()?;
         w.write_image_data(&img.px)?;
@@ -306,22 +311,132 @@ pub fn encode_png_paletted(w: u32, h: u32, palette: &[[u8; 3]], idx: &[u8], tran
         }
         enc.set_deflate_compression(compression);
         let mut wr = enc.write_header()?;
-        if bits == 8 {
-            wr.write_image_data(idx)?;
-        } else {
-            let mask = (1u8 << bits) - 1;
-            let per = 8 / bits as usize;
-            let row_bytes = (w as usize).div_ceil(per);
-            let mut packed = vec![0u8; row_bytes * h as usize];
-            for y in 0..h as usize {
-                for x in 0..w as usize {
-                    let v = idx[y * w as usize + x] & mask;
-                    let shift = 8 - bits as usize * (x % per + 1);
-                    packed[y * row_bytes + x / per] |= v << shift;
-                }
-            }
-            wr.write_image_data(&packed)?;
+        write_indices(&mut wr, w, h, bits, idx)?;
+    }
+    Ok(out)
+}
+
+/// Palette indices as PNG rows of `bits` per pixel (8: as is; less: packed, high bits first,
+/// keeping only each index's low bits).
+fn write_indices<W: std::io::Write>(wr: &mut png::Writer<W>, w: u32, h: u32, bits: u8, idx: &[u8]) -> Result<()> {
+    if bits == 8 {
+        wr.write_image_data(idx)?;
+        return Ok(());
+    }
+    let mask = (1u8 << bits) - 1;
+    let per = 8 / bits as usize;
+    let row_bytes = (w as usize).div_ceil(per);
+    let mut packed = vec![0u8; row_bytes * h as usize];
+    for y in 0..h as usize {
+        for x in 0..w as usize {
+            let v = idx[y * w as usize + x] & mask;
+            let shift = 8 - bits as usize * (x % per + 1);
+            packed[y * row_bytes + x / per] |= v << shift;
         }
+    }
+    wr.write_image_data(&packed)?;
+    Ok(())
+}
+
+/// `encoding_options.lossless: true` (rMapproxy only): the same pixels in fewer bytes. ≤256
+/// distinct RGBA values (sea, sparse land, empty margins) → palette PNG whose tRNS holds each
+/// entry's exact alpha; else opaque → RGB; else RGBA. Decodes to exactly `img` (each RGBA value
+/// incl. RGB under alpha 0). Not MapProxy's bytes, so off by default.
+pub fn encode_png_lossless(img: &Rgba, compression: png::DeflateCompression) -> Result<Vec<u8>> {
+    if let Some((pal, idx)) = exact_palette(img) {
+        return encode_png_exact_palette(img.w, img.h, &pal, &idx, compression);
+    }
+    if img.px.as_chunks::<4>().0.iter().all(|p| p[3] == 255) {
+        let rgb: Vec<u8> = img.px.as_chunks::<4>().0.iter().flat_map(|p| [p[0], p[1], p[2]]).collect();
+        let mut out = Vec::with_capacity(rgb.len() / 4);
+        {
+            let mut enc = png::Encoder::new(&mut out, img.w, img.h);
+            enc.set_color(png::ColorType::Rgb);
+            enc.set_depth(png::BitDepth::Eight);
+            // No row filter: flat areas, hatching and repeated symbols deflate better unfiltered
+            // (topo samples: 76-81 % of the Adaptive size, and faster).
+            enc.set_filter(png::Filter::NoFilter);
+            enc.set_deflate_compression(compression);
+            enc.write_header()?.write_image_data(&rgb)?;
+        }
+        return Ok(out);
+    }
+    encode_png_rgba_filtered(img, compression, png::Filter::NoFilter)
+}
+
+/// Palette + indices if `img` has ≤256 distinct RGBA values, else None (stops at the 257th).
+/// Non-opaque entries first, so tRNS ends at the last of them (opaque ones need none).
+fn exact_palette(img: &Rgba) -> Option<(Vec<[u8; 4]>, Vec<u8>)> {
+    let px = img.px.as_chunks::<4>().0;
+    let mut map: std::collections::HashMap<[u8; 4], u8> = std::collections::HashMap::with_capacity(512);
+    let mut pal: Vec<[u8; 4]> = Vec::new();
+    let mut idx = Vec::with_capacity(px.len());
+    let mut last: Option<([u8; 4], u8)> = None;
+    for p in px {
+        // Runs of one colour are the norm in tiles: skip the hash lookup for them.
+        let i = match last {
+            Some((c, i)) if c == *p => i,
+            _ => {
+                let i = match map.get(p) {
+                    Some(&i) => i,
+                    None => {
+                        if pal.len() == 256 {
+                            return None;
+                        }
+                        let i = pal.len() as u8;
+                        map.insert(*p, i);
+                        pal.push(*p);
+                        i
+                    }
+                };
+                last = Some((*p, i));
+                i
+            }
+        };
+        idx.push(i);
+    }
+    // Reorder: translucent entries first (stable), then remap the indices.
+    let mut order: Vec<usize> = (0..pal.len()).collect();
+    order.sort_by_key(|&i| pal[i][3] == 255);
+    let mut remap = [0u8; 256];
+    for (new, &old) in order.iter().enumerate() {
+        remap[old] = new as u8;
+    }
+    let pal = order.iter().map(|&i| pal[i]).collect();
+    for i in &mut idx {
+        *i = remap[*i as usize];
+    }
+    Some((pal, idx))
+}
+
+/// Indexed PNG for `exact_palette`: smallest bit depth for the entry count, tRNS only up to the
+/// last translucent entry, no row filter (palette rows rarely gain from one, and it costs time).
+fn encode_png_exact_palette(w: u32, h: u32, pal: &[[u8; 4]], idx: &[u8], compression: png::DeflateCompression) -> Result<Vec<u8>> {
+    let bits: u8 = match pal.len() {
+        0..=2 => 1,
+        3..=4 => 2,
+        5..=16 => 4,
+        _ => 8,
+    };
+    let mut out = Vec::new();
+    {
+        let mut enc = png::Encoder::new(&mut out, w, h);
+        enc.set_color(png::ColorType::Indexed);
+        enc.set_depth(match bits {
+            1 => png::BitDepth::One,
+            2 => png::BitDepth::Two,
+            4 => png::BitDepth::Four,
+            _ => png::BitDepth::Eight,
+        });
+        enc.set_palette(pal.iter().flat_map(|p| [p[0], p[1], p[2]]).collect::<Vec<u8>>());
+        let translucent = pal.iter().take_while(|p| p[3] != 255).count();
+        if translucent > 0 {
+            enc.set_trns(pal[..translucent].iter().map(|p| p[3]).collect::<Vec<u8>>());
+        }
+        enc.set_filter(png::Filter::NoFilter);
+        enc.set_deflate_compression(compression);
+        let mut wr = enc.write_header()?;
+        write_indices(&mut wr, w, h, bits, idx)?;
     }
     Ok(out)
 }
@@ -437,6 +552,101 @@ fn apply_alpha(img: &Rgba, mut pal: Vec<[u8; 3]>, mut idx: Vec<u8>) -> (Vec<[u8;
 
 #[cfg(test)]
 mod tests {
+
+    /// `encode_png_lossless` decodes to exactly its input, in the expected PNG form: palette for
+    /// ≤256 RGBA values (any alpha, RGB under alpha 0 kept), RGB when opaque, RGBA otherwise.
+    #[test]
+    fn lossless_roundtrips_exactly() {
+        let ctype = |png: &[u8]| png::Decoder::new(std::io::Cursor::new(png)).read_info().unwrap().info().color_type;
+        let depth = |png: &[u8]| png::Decoder::new(std::io::Cursor::new(png)).read_info().unwrap().info().bit_depth as u8;
+        let (w, h) = (61, 17);
+        let with = |n: usize, alpha: fn(usize) -> u8| {
+            let mut img = Rgba::filled(w, h, [0, 0, 0, 0]);
+            for (k, p) in img.px.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                let c = (k * 7919) % n;
+                *p = [c as u8, (c >> 8) as u8 ^ 0x5a, (c * 3) as u8, alpha(c)];
+            }
+            img
+        };
+        // (distinct colours, alpha per colour, expected colour type, expected bit depth)
+        type Case = (usize, fn(usize) -> u8, png::ColorType, u8);
+        let cases: [Case; 7] = [
+            (1, |_| 255, png::ColorType::Indexed, 1),
+            (2, |c| if c == 0 { 0 } else { 255 }, png::ColorType::Indexed, 1),
+            (4, |c| (c * 60) as u8, png::ColorType::Indexed, 2),
+            (16, |c| if c % 3 == 0 { 0 } else { 255 }, png::ColorType::Indexed, 4),
+            (256, |c| (c % 7 * 40) as u8, png::ColorType::Indexed, 8),
+            (257, |_| 255, png::ColorType::Rgb, 8),
+            (900, |c| (c % 5 * 60) as u8, png::ColorType::Rgba, 8),
+        ];
+        for (n, alpha, want, bits) in cases {
+            let img = with(n, alpha);
+            let png = encode_png_lossless(&img, PNG_BALANCED).unwrap();
+            assert_eq!(decode_png(&png).unwrap().0, img, "{n} colours");
+            assert_eq!(ctype(&png), want, "{n} colours");
+            assert_eq!(depth(&png), bits, "{n} colours");
+        }
+        // Distinct RGB under alpha 0 are distinct entries, and survive.
+        let mut img = Rgba::filled(4, 1, [0, 0, 0, 0]);
+        img.px[4..8].copy_from_slice(&[9, 8, 7, 0]);
+        img.px[8..12].copy_from_slice(&[1, 2, 3, 128]);
+        assert_eq!(decode_png(&encode_png_lossless(&img, PNG_TILE).unwrap()).unwrap().0, img);
+    }
+
+    /// Sizes/time of `encode_png_lossless` vs the RGBA encoding on real tiles, every result checked
+    /// to decode to the same pixels. `RMAPPROXY_TILE_SAMPLES=dir cargo test --release lossless_on_samples -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn lossless_on_samples() {
+        let Ok(dir) = std::env::var("RMAPPROXY_TILE_SAMPLES") else { return };
+        type Enc = fn(&Rgba) -> Result<Vec<u8>>;
+        let encs: [(&str, Enc); 6] = [
+            ("rgba L4 (now)", |i| encode_png_rgba(i, PNG_TILE)),
+            ("rgba None L4", |i| encode_png_rgba_filtered(i, PNG_TILE, png::Filter::NoFilter)),
+            ("lossless L4", |i| encode_png_lossless(i, PNG_TILE)),
+            ("lossless L6", |i| encode_png_lossless(i, PNG_BALANCED)),
+            ("lossless L9", |i| encode_png_lossless(i, png::DeflateCompression::Level(9))),
+            ("rgba L9", |i| encode_png_rgba(i, png::DeflateCompression::Level(9))),
+        ];
+        let mut files: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).filter(|p| p.extension().is_some_and(|x| x == "png")).collect();
+        files.sort();
+        // group (z <= 12 | z >= 13) -> per encoder (bytes, micros); plus kinds
+        let mut tot = [[(0u64, 0u128); 6]; 2];
+        let mut orig = [0u64; 2];
+        let (mut n, mut kinds) = ([0u32; 2], [[0u32; 3]; 2]);
+        for f in files {
+            let data = std::fs::read(&f).unwrap();
+            let name = f.file_name().unwrap().to_string_lossy().to_string();
+            let z: u32 = name.split('_').nth(1).unwrap().parse().unwrap();
+            let g = usize::from(z >= 13);
+            let (img, _) = decode_png(&data).unwrap();
+            orig[g] += data.len() as u64;
+            n[g] += 1;
+            let k = if exact_palette(&img).is_some() { 0 } else if img.px.as_chunks::<4>().0.iter().all(|p| p[3] == 255) { 1 } else { 2 };
+            kinds[g][k] += 1;
+            for (e, (label, enc)) in encs.iter().enumerate() {
+                let t = std::time::Instant::now();
+                let mut out = Vec::new();
+                for _ in 0..3 {
+                    out = enc(&img).unwrap();
+                }
+                tot[g][e].1 += t.elapsed().as_micros() / 3;
+                tot[g][e].0 += out.len() as u64;
+                let (back, _) = decode_png(&out).unwrap();
+                assert!(back == img, "{label}: {name} decodes to different pixels");
+            }
+        }
+        for g in 0..2 {
+            if n[g] == 0 {
+                continue;
+            }
+            println!("{} : {} tiles, served files {} KB avg; palette {} / RGB {} / RGBA {}", ["z<=12", "z>=13"][g], n[g], orig[g] / n[g] as u64 / 1024, kinds[g][0], kinds[g][1], kinds[g][2]);
+            for (e, (label, _)) in encs.iter().enumerate() {
+                let (b, us) = tot[g][e];
+                println!("  {label:15} avg {:6.1} KB  {:5.1} % of now  {:6.2} ms/tile  (pixel-identical)", b as f64 / n[g] as f64 / 1024.0, 100.0 * b as f64 / tot[g][0].0 as f64, us as f64 / n[g] as f64 / 1000.0);
+            }
+        }
+    }
     use super::*;
 
     /// Streaming merge = decode_png + Merger's paste/composite, for every colour type and offset.
@@ -572,7 +782,7 @@ mod tests {
         let dir = std::env::var("QUANT_EVAL_DIR").expect("QUANT_EVAL_DIR");
         let style: [(&str, [u8; 3]); 4] =
             [("shield", [84, 140, 56]), ("mwy-core", [255, 255, 0]), ("mwy-fill", [230, 104, 104]), ("riksveg", [255, 255, 254])];
-        let mut files: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).collect();
+        let mut files: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).filter(|p| p.extension().is_some_and(|x| x == "png")).collect();
         files.sort();
         for f in files.iter().filter(|f| f.extension().is_some_and(|e| e == "png")) {
             let (img, _) = decode_png(&std::fs::read(f).unwrap()).unwrap();

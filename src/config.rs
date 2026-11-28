@@ -28,6 +28,9 @@ pub struct ImageOpts {
     /// `encoding_options.quantizer`: fastoctree (default), mediancut, or mediancut_spot (rMapproxy only).
     pub quantizer: Option<String>,
     pub transparent: Option<bool>,
+    /// `encoding_options.lossless: true` (rMapproxy only): write each tile in the smallest exact
+    /// PNG form (`image::encode_png_lossless`). Same pixels as without, not MapProxy's bytes.
+    pub lossless: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -414,6 +417,10 @@ impl Config {
                                 .and_then(|i| get(i, &["encoding_options", "quantizer"]))
                                 .and_then(str_of),
                             transparent: img.and_then(|i| i.get("transparent")).and_then(|t| t.as_bool()),
+                            lossless: img
+                                .and_then(|i| get(i, &["encoding_options", "lossless"]))
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false),
                         },
                         name,
                     },

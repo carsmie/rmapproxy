@@ -410,6 +410,14 @@ fn encode(img: &Rgba, opts: &ImageOpts) -> Result<Vec<u8>> {
             crate::metrics::stage("quantize", t.elapsed());
             let t = std::time::Instant::now();
             let png = crate::image::encode_png_paletted(img.w, img.h, &pal, &idx, true, crate::image::PNG_TILE);
+            // lossless: re-encode what that file decodes to (incl. MapProxy's index-255 quirk), so
+            // the pixels stay those of the MapProxy-compatible tile; 512² 2x tiles −5-15 %.
+            let png = match png {
+                Ok(p) if opts.lossless => {
+                    crate::image::decode_png(&p).and_then(|(q, _)| crate::image::encode_png_lossless(&q, crate::image::PNG_BALANCED))
+                }
+                other => other,
+            };
             crate::metrics::stage("png_encode", t.elapsed());
             return png;
         }
@@ -418,7 +426,8 @@ fn encode(img: &Rgba, opts: &ImageOpts) -> Result<Vec<u8>> {
         WARNED.call_once(|| warn!("image.colors with the fastoctree quantizer is not implemented; writing RGBA"));
     }
     let t = std::time::Instant::now();
-    let png = encode_png_rgba(img, crate::image::PNG_TILE);
+    // lossless at zlib 6: topo 1x −24-27 % at about today's encode CPU (level 4 RGBA, Adaptive).
+    let png = if opts.lossless { crate::image::encode_png_lossless(img, crate::image::PNG_BALANCED) } else { encode_png_rgba(img, crate::image::PNG_TILE) };
     crate::metrics::stage("png_encode", t.elapsed());
     png
 }
@@ -443,6 +452,25 @@ mod tests {
             };
         }
         img
+    }
+
+    /// `lossless` changes bytes, never pixels: same decode as without it, for RGBA and both
+    /// mediancut quantizers (2x path), on a noisy and on a flat-coloured image.
+    #[test]
+    fn lossless_option_keeps_pixels() {
+        let mut flat = Rgba::filled(128, 96, [200, 220, 240, 255]);
+        for p in flat.px.as_chunks_mut::<4>().0.iter_mut().step_by(37) {
+            *p = [30, 90, 30, 255];
+        }
+        for img in [layer(128, 96, 7), flat] {
+            for (colors, q) in [(None, None), (Some(256), Some("mediancut")), (Some(256), Some("mediancut_spot"))] {
+                let base = ImageOpts { colors, quantizer: q.map(String::from), transparent: Some(true), lossless: false };
+                let lossless = ImageOpts { lossless: true, ..base.clone() };
+                let a = crate::image::decode_png(&encode(&img, &base).unwrap()).unwrap().0;
+                let b = crate::image::decode_png(&encode(&img, &lossless).unwrap()).unwrap().0;
+                assert!(a == b, "{q:?}: lossless changed pixels");
+            }
+        }
     }
 
     /// `add_empty` gives the same pixels as decoding an all-zero RGBA PNG through `add_png`,

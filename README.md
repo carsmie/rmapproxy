@@ -28,6 +28,12 @@ demand at once; requests for tiles of a metatile already being rendered wait for
 GetMap, the bbox centre in `RMAPPROXY_AFFINITY_CELL_M` cells (default 5000 m). A mesh that hashes
 on it (Istio `consistentHash.httpHeaderName`) sends one layer's requests for one area to the same
 backend pod, keeping its data caches warm, while a layer still spreads over many pods.
+Cache `image.encoding_options.lossless: true` (rMapproxy only, default off) writes each tile in the
+smallest exact PNG form instead of MapProxy's RGBA: a palette PNG when the tile has ≤256 RGBA values
+(tRNS keeps every alpha), RGB when it is opaque, else RGBA; rows unfiltered, zlib 6. With `colors` it
+re-encodes what the quantised file decodes to. Pixels stay identical (checked by decoding back:
+`lossless_on_samples`, an ignored test over a tile dir); topo tiles shrink 24-27 % (1x) and 5-15 % (2x
+palette) at about the same encode CPU. Files differ from MapProxy's bytes, hence opt-in.
 `POST /_admin/estimate` prices seed jobs per (cache, level) from finished distributed jobs: each
 history entry keeps `levels` (metatiles and worker seconds per cache/grid/level) and `wall_seconds`;
 `src/costmodel.rs` turns them into wall seconds per metatile as achieved (incl. the parallelism the
