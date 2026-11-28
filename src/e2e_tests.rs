@@ -363,6 +363,45 @@ async fn distributed_failed_chunks_are_retried_before_the_job_fails() {
     assert_eq!(run_distributed(&base, |_| 1).await, (3, "failed".into()));
 }
 
+/// A finished distributed job records per-level worker time and wall time in the history, and
+/// the estimate then prices that (cache, level) from it (`basis: levels`) with the ramp added.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn distributed_history_feeds_the_level_estimate() {
+    let env = Env::new("estmodel").await;
+    let opts = crate::admin::AdminOpts {
+        mapproxy_conf: env.dir.join("mapproxy.yaml"),
+        seed_conf: env.dir.join("seed.yaml"),
+        assets: env.dir.join("admin"),
+        login: None,
+    };
+    let base = spawn(crate::server::app(env.mgr(0), Some(opts)).unwrap()).await;
+    let task = serde_json::json!({"tasks": [{"name": "s", "levels_from": 1, "levels_to": 1}]});
+    let (_, before) = admin_post(&base, "estimate", task.clone()).await;
+    assert_ne!(before["basis"], "levels");
+    let mut req = task.clone();
+    req["distributed"] = true.into();
+    let (_, job) = admin_post(&base, "jobs", req).await;
+    let id = job["id"].as_str().unwrap().to_string();
+    loop {
+        let (status, c) = admin_post(&base, "work/claim", serde_json::json!({"worker": "w"})).await;
+        if status == 204 {
+            break;
+        }
+        let body = serde_json::json!({"worker": "w", "job": id, "chunk": c["chunk"], "tiles": 600, "errors": 0, "metatiles": 150, "seconds": 30.0});
+        admin_post(&base, "work/complete", body).await;
+    }
+    let h: serde_json::Value = serde_json::from_slice(&reqwest::get(format!("{base}/_admin/history")).await.unwrap().bytes().await.unwrap()).unwrap();
+    let last = h.as_array().unwrap().iter().rev().find(|e| e["key"] == id.as_str()).expect("history entry");
+    assert!(last["wall_seconds"].as_f64().unwrap() >= 0.0, "{last}");
+    assert_eq!(last["levels"][0]["z"], 1);
+    assert!(last["levels"][0]["metatiles"].as_u64().unwrap() >= 150, "{last}");
+    let (st, e) = admin_post(&base, "estimate", task).await;
+    assert_eq!((st, &e["basis"]), (200, &serde_json::json!("levels")), "{e}");
+    assert_eq!(e["model_jobs"], 1);
+    let (lo, mid, hi) = (e["seconds_low"].as_f64().unwrap(), e["seconds"].as_f64().unwrap(), e["seconds_high"].as_f64().unwrap());
+    assert!(lo <= mid && mid <= hi, "{e}");
+}
+
 /// Bbox tasks on every grid of the cache, and refresh orders: levels split at `delete_from`,
 /// bad requests start nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

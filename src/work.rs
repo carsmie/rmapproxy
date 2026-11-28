@@ -62,6 +62,7 @@ pub struct Queue {
     pub errors: u64,
     /// Automatic retry rounds of failed chunks done so far (see admin `AUTO_RETRY_ROUNDS`).
     pub auto_retries: u32,
+    pub levels: std::collections::BTreeMap<(String, String, u32), (u64, f64)>,
 }
 
 impl Queue {
@@ -118,6 +119,7 @@ impl Queue {
             tiles: 0,
             errors: 0,
             auto_retries: 0,
+            levels: Default::default(),
         })
     }
 
@@ -262,7 +264,20 @@ impl Queue {
         }
     }
 
-    /// A worker finished chunk `i` (also accepted after a lost lease: the tiles are written).
+    pub fn complete_timed(&mut self, i: usize, tiles: u64, errors: u64, metatiles: u64, seconds: f64) -> bool {
+        let key = self.chunks.get(i).map(|c| (c.task as usize, c.z));
+        if !self.complete(i, tiles, errors) {
+            return false;
+        }
+        if let Some((task, z)) = key && errors == 0 && metatiles > 0 && seconds > 0.0 {
+            let (_, cache, grid) = &self.tasks[task];
+            let e = self.levels.entry((cache.clone(), grid.clone(), z)).or_default();
+            e.0 += metatiles;
+            e.1 += seconds;
+        }
+        true
+    }
+
     pub fn complete(&mut self, i: usize, tiles: u64, errors: u64) -> bool {
         if i >= self.state.len() || matches!(self.state[i], St::Done | St::Failed) {
             return false;
@@ -517,7 +532,19 @@ mod tests {
             tiles: 0,
             errors: 0,
             auto_retries: 0,
+            levels: Default::default(),
         }
+    }
+
+    /// Per-level stats: successful chunks only, summed per (cache, grid, level).
+    #[test]
+    fn complete_timed_records_levels() {
+        let mut q = queue(3);
+        assert!(q.complete_timed(0, 8, 0, 2, 3.0));
+        assert!(q.complete_timed(1, 4, 1, 2, 9.0)); // failed chunk: not recorded
+        assert!(q.complete_timed(2, 8, 0, 2, 1.0));
+        assert!(!q.complete_timed(2, 8, 0, 2, 1.0)); // already done
+        assert_eq!(q.levels.get(&("c".into(), "g".into(), 1)), Some(&(4, 4.0)));
     }
 
     #[test]

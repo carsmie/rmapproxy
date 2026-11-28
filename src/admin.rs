@@ -72,6 +72,7 @@ pub struct Admin {
     concurrency: usize,
     max_jobs: usize,
     stats_interval: Duration,
+    ramp_secs: f64,
     legend_cache: String,
     legend_dir: PathBuf,
     /// seed.yaml with bases and merge keys applied.
@@ -324,6 +325,7 @@ impl Admin {
             concurrency: env_num("SEED_CONCURRENCY", 4usize).clamp(1, 64),
             max_jobs: env_num("RMAPPROXY_ADMIN_MAX_JOBS", 2usize).max(1),
             stats_interval: Duration::from_secs(env_num("RMAPPROXY_ADMIN_STATS_INTERVAL", 900u64).max(60)),
+            ramp_secs: env_num("RMAPPROXY_ADMIN_RAMP_SECS", 0u64) as f64,
             legend_cache: std::env::var("RMAPPROXY_LEGEND_CACHE").unwrap_or_else(|_| "topo_cache".into()),
             mgr,
             opts,
@@ -464,6 +466,15 @@ impl Admin {
             "tiles": job.tiles,
             "errors": job.errors,
         }));
+        // Distributed jobs: per-level worker time and the run's wall time, for the estimate model.
+        if let (Some(q), Some(end), Some(e)) = (&job.queue, job.finished_at, h.last_mut()) {
+            e["wall_seconds"] = end.duration_since(job.run_started_at).map(|d| d.as_secs_f64()).unwrap_or(0.0).into();
+            e["levels"] = q
+                .levels
+                .iter()
+                .map(|((cache, grid, z), (m, s))| json!({ "cache": cache, "grid": grid, "z": z, "metatiles": m, "worker_seconds": s }))
+                .collect();
+        }
         let skip = h.len().saturating_sub(HISTORY_MAX);
         if let Err(e) = write_atomic(&self.history_path(), Json::Array(h.split_off(skip)).to_string().as_bytes()) {
             warn!("admin: seed history: {e:#}");
@@ -1339,7 +1350,8 @@ impl Admin {
             let mut jobs = self.jobs.lock();
             let Some(j) = jobs.iter_mut().find(|j| j.id == job) else { return };
             let Some(q) = j.queue.as_mut() else { return };
-            if !q.complete(chunk, tiles, errors) {
+            let (metas, secs) = (b["metatiles"].as_u64().unwrap_or(0), b["seconds"].as_f64().unwrap_or(0.0));
+            if !q.complete_timed(chunk, tiles, errors, metas, secs) {
                 return;
             }
             j.last_activity = SystemTime::now();
@@ -1483,19 +1495,35 @@ impl Admin {
         let (conf, names, _, _) = self.build_conf(req, mode)?;
         let tasks = seed::load_tasks_from(&self.mgr, &conf, &self.dir, &names, mode)?;
         let (mut metas, mut tiles) = (0u64, 0u64);
-        let mut per = vec![];
+        let (mut per, mut levels) = (vec![], vec![]);
         for t in &tasks {
-            let (m, n) = estimate_task(t)?;
+            let lv = estimate_task(t)?;
+            let (m, n) = lv.iter().fold((0, 0), |a, l| (a.0 + l.1, a.1 + l.2));
             metas += m;
             tiles += n;
+            levels.extend(lv.iter().map(|l| (t.cg.cache.clone(), l.0 as u32, l.1)));
             per.push(json!({ "name": t.name, "cache": t.cg.cache, "grid": t.cg.grid, "metatiles": m, "tiles": n }));
         }
         let rate = self.recent_rate();
-        Ok(json!({
+        let mut out = json!({
             "tasks": per, "metatiles": metas, "tiles": tiles,
             "rate_tiles_per_second": rate,
             "seconds": rate.map(|r| tiles as f64 / r),
-        }))
+            "basis": if rate.is_some() { "average" } else { "none" },
+        });
+        // Per (cache, level) model from finished distributed jobs, when there is any.
+        let model = crate::costmodel::Model::learn(&self.read_history(), self.ramp_secs);
+        if mode == Mode::Seed && let Some(p) = model.predict(&levels) {
+            out["seconds"] = p.seconds.into();
+            out["seconds_low"] = p.low.into();
+            out["seconds_high"] = p.high.into();
+            out["known_metatiles"] = p.known_metatiles.into();
+            out["assumed_metatiles"] = p.assumed_metatiles.into();
+            out["model_jobs"] = model.jobs.into();
+            out["ramp_seconds"] = self.ramp_secs.into();
+            out["basis"] = "levels".into();
+        }
+        Ok(out)
     }
 
     // ── standing jobs (seed.yaml x-schedule) ────────────────────────────────
@@ -1924,7 +1952,7 @@ fn url_escape(s: &str) -> String {
 /// Metatiles and tiles a task touches: the coverage extent's tile range per level, refined by the
 /// coverage test where metatiles are few, else the last refined level's hit ratio. Estimated before
 /// refresh_before skips existing tiles.
-fn estimate_task(t: &seed::SeedTask) -> Result<(u64, u64)> {
+fn estimate_task(t: &seed::SeedTask) -> Result<Vec<(usize, u64, u64)>> {
     let mg = &t.cg.meta;
     let g = &mg.grid;
     let bbox = match &t.coverage {
@@ -1957,7 +1985,7 @@ fn estimate_task(t: &seed::SeedTask) -> Result<(u64, u64)> {
         }
         Ok(hit)
     };
-    let (mut metas, mut tiles) = (0u64, 0u64);
+    let mut out = vec![];
     let mut ratio: Option<f64> = None;
     // A deep level alone (e.g. only z14) is too big to test: take the hit ratio from the deepest
     // shallower level that is testable, not the whole bbox (~3.4x too high for Norway).
@@ -1972,22 +2000,17 @@ fn estimate_task(t: &seed::SeedTask) -> Result<(u64, u64)> {
         match &t.coverage {
             Some(c) if level_metas <= 20_000 => {
                 let hit = hits(c, z, (mx0, mx1, my0, my1), ms)?;
-                metas += hit;
-                tiles += level_tiles * hit / level_metas.max(1);
+                out.push((z, hit, level_tiles * hit / level_metas.max(1)));
                 ratio = Some(hit as f64 / level_metas.max(1) as f64);
             }
             Some(_) if ratio.is_some() => {
                 let r = ratio.unwrap_or(1.0);
-                metas += (level_metas as f64 * r).round() as u64;
-                tiles += (level_tiles as f64 * r).round() as u64;
+                out.push((z, (level_metas as f64 * r).round() as u64, (level_tiles as f64 * r).round() as u64));
             }
-            _ => {
-                metas += level_metas;
-                tiles += level_tiles;
-            }
+            _ => out.push((z, level_metas, level_tiles)),
         }
     }
-    Ok((metas, tiles))
+    Ok(out)
 }
 
 #[derive(Default)]

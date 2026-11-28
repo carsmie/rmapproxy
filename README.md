@@ -28,6 +28,12 @@ demand at once; requests for tiles of a metatile already being rendered wait for
 GetMap, the bbox centre in `RMAPPROXY_AFFINITY_CELL_M` cells (default 5000 m). A mesh that hashes
 on it (Istio `consistentHash.httpHeaderName`) sends one layer's requests for one area to the same
 backend pod, keeping its data caches warm, while a layer still spreads over many pods.
+`POST /_admin/estimate` prices seed jobs per (cache, level) from finished distributed jobs: each
+history entry keeps `levels` (metatiles and worker seconds per cache/grid/level) and `wall_seconds`;
+`src/costmodel.rs` turns them into wall seconds per metatile as achieved (incl. the parallelism the
+work reached), adds `RMAPPROXY_ADMIN_RAMP_SECS` (default 0: time to reach full speed) once, and
+returns `seconds` with a `seconds_low`–`seconds_high` range, wider when levels are priced from a
+neighbouring level. Without such history it falls back to the old tiles/s average (`basis`).
 `/_admin` sends no CORS headers and refuses non-GET requests from other sites. With
 `RMAPPROXY_WORKER_TOKEN` set on the admin and the workers, `/_admin/work/*` requires it as a
 bearer token. `RMAPPROXY_ADMIN_PASSWORD` (default unset: open) puts a login in front of the GUI and

@@ -3,6 +3,7 @@
 mod admin;
 mod cache;
 mod config;
+mod costmodel;
 mod coverage;
 #[cfg(test)]
 mod e2e_tests;
