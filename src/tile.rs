@@ -229,6 +229,7 @@ impl TileManager {
                     merger.add_transparent();
                 }
                 SourceImage::Decoded(img, mode) => merger.add(img, mode),
+                SourceImage::Empty => merger.add_empty(),
                 SourceImage::Png { data, size: sub, place } => {
                     // Decode + composite on this worker without stalling the runtime.
                     let t = std::time::Instant::now();
@@ -326,6 +327,24 @@ impl Merger {
         }
     }
 
+    /// A fully transparent layer the backend didn't send pixels for (`SourceImage::Empty`): the
+    /// same result as decoding an all-zero RGBA image and `add`ing it — compositing alpha 0 is a
+    /// no-op (`composite_px`), so only the first-layer slot needs the zero image itself (a
+    /// metatile of only empty layers stays (0,0,0,0), not the (255,255,255,0) blank).
+    fn add_empty(&mut self) {
+        if self.canvas.is_some() {
+            return;
+        }
+        match self.first.take() {
+            Some((f, fm)) => {
+                let mut c = Rgba::blank(self.size.0, self.size.1);
+                Self::apply(&mut c, &f, fm);
+                self.canvas = Some(c);
+            }
+            None => self.first = Some((Rgba::filled(self.size.0, self.size.1, [0, 0, 0, 0]), MergeMode::Composite)),
+        }
+    }
+
     fn add(&mut self, img: Rgba, mode: MergeMode) {
         if let Some(c) = &mut self.canvas {
             Self::apply(c, &img, mode);
@@ -395,4 +414,54 @@ fn encode(img: &Rgba, opts: &ImageOpts) -> Result<Vec<u8>> {
     let png = encode_png_rgba(img, crate::image::PNG_TILE);
     crate::metrics::stage("png_encode", t.elapsed());
     png
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::image::{PNG_TILE, encode_png_rgba};
+
+    fn layer(w: u32, h: u32, seed: u32) -> Rgba {
+        let mut img = Rgba::filled(w, h, [0, 0, 0, 0]);
+        let mut x = seed.wrapping_mul(2654435761) | 1;
+        for p in img.px.as_chunks_mut::<4>().0 {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            // Mix of transparent, semi-transparent and opaque pixels.
+            *p = match x % 4 {
+                0 => [0, 0, 0, 0],
+                1 => [(x >> 8) as u8, (x >> 16) as u8, (x >> 24) as u8, 255],
+                _ => [(x >> 8) as u8, (x >> 16) as u8, (x >> 24) as u8, (x >> 4) as u8],
+            };
+        }
+        img
+    }
+
+    /// `add_empty` gives the same pixels as decoding an all-zero RGBA PNG through `add_png`,
+    /// wherever the empty layers sit (first, middle, last, only).
+    #[test]
+    fn add_empty_matches_decoding_an_empty_png() {
+        let (w, h) = (37, 23);
+        let empty_png = encode_png_rgba(&Rgba::filled(w, h, [0, 0, 0, 0]), PNG_TILE).unwrap();
+        let pngs: Vec<Vec<u8>> = (1..=2).map(|s| encode_png_rgba(&layer(w, h, s), PNG_TILE).unwrap()).collect();
+        // 'E' empty, '1'/'2' drawn layers.
+        for seq in ["E", "EE", "E1", "1E", "E1E", "1E2", "EE1", "12E", "EEE", "E12", "1EE"] {
+            let (mut a, mut b) = (Merger::new((w, h)), Merger::new((w, h)));
+            for c in seq.chars() {
+                match c {
+                    'E' => {
+                        a.add_png(&empty_png, (w, h), None).unwrap();
+                        b.add_empty();
+                    }
+                    d => {
+                        let png = &pngs[d.to_digit(10).unwrap() as usize - 1];
+                        a.add_png(png, (w, h), None).unwrap();
+                        b.add_png(png, (w, h), None).unwrap();
+                    }
+                }
+            }
+            assert_eq!(a.finish().px, b.finish().px, "sequence {seq}");
+        }
+    }
 }

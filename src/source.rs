@@ -55,6 +55,10 @@ pub enum SourceImage {
     Png { data: Vec<u8>, size: (u32, u32), place: Option<(i64, i64)> },
     /// A reprojected image, metatile-sized, ready to merge.
     Decoded(Rgba, MergeMode),
+    /// The backend said the image is fully transparent (`X-Empty-Image: 1`, e.g. rGIS when
+    /// nothing was drawn): merged as an all-zero RGBA layer without decoding it. Unlike
+    /// `Transparent`, cacheable.
+    Empty,
 }
 
 impl SourceImage {
@@ -139,10 +143,10 @@ impl WmsSource {
                 return Ok(SourceImage::Skip);
             }
             // sub_image_result: pasted into a transparent canvas, composited when merged.
-            let data = self.request(sub_bbox, sub_size, srs).await?;
+            let Some(data) = self.request(sub_bbox, sub_size, srs).await? else { return Ok(SourceImage::Empty) };
             return Ok(SourceImage::Png { data, size: sub_size, place: Some(off) });
         }
-        let data = self.request(bbox, size, srs).await?;
+        let Some(data) = self.request(bbox, size, srs).await? else { return Ok(SourceImage::Empty) };
         Ok(SourceImage::Png { data, size, place: None })
     }
 
@@ -167,12 +171,13 @@ impl WmsSource {
                 if sub_size.0 == 0 || sub_size.1 == 0 {
                     return Ok(SourceImage::Skip);
                 }
-                let data = self.request(sub_bbox, sub_size, &src_srs).await?;
+                // Empty source: the warped image would be all zero too.
+                let Some(data) = self.request(sub_bbox, sub_size, &src_srs).await? else { return Ok(SourceImage::Empty) };
                 let (img, _) = tokio::task::block_in_place(|| SourceImage::decode(&data, sub_size, Some(off), src_size))?;
                 (img, true, MergeMode::Composite)
             }
             _ => {
-                let data = self.request(src_bbox, src_size, &src_srs).await?;
+                let Some(data) = self.request(src_bbox, src_size, &src_srs).await? else { return Ok(SourceImage::Empty) };
                 let (mut img, mode, ctype) = tokio::task::block_in_place(|| decode_png_typed(&data))?;
                 if (img.w, img.h) != src_size {
                     bail!("got {}x{}, asked {}x{}", img.w, img.h, src_size.0, src_size.1);
@@ -231,7 +236,8 @@ impl WmsSource {
     /// GetMap with retries on transient upstream failures (`RETRY_BACKOFF`): a dying backend pod
     /// (OOMKill, rollout) fails its in-flight requests with 503/reset for seconds; Istio's
     /// immediate retries hit the same dead endpoint.
-    async fn request(&self, bbox: BBox, size: (u32, u32), srs: &Srs) -> Result<Vec<u8>> {
+    /// `None`: the backend marked the image fully transparent (`X-Empty-Image: 1`).
+    async fn request(&self, bbox: BBox, size: (u32, u32), srs: &Srs) -> Result<Option<Vec<u8>>> {
         let url = self.getmap_url(bbox, size, srs);
         let affinity = AFFINITY.as_ref().map(|a| (&a.header, affinity_key(&self.conf.name, bbox, srs, a.cell_m)));
         debug!("source {}: {url}", self.conf.name);
@@ -255,15 +261,16 @@ impl WmsSource {
                     attempted("error", t0, 0);
                     return Err(e);
                 }
-                Ok(body) => {
+                Ok((body, empty)) => {
                     attempted("ok", t0, body.len());
-                    return Ok(body);
+                    return Ok((!empty).then_some(body));
                 }
             }
         }
     }
 
-    async fn request_once(&self, url: &str, affinity: Option<(&reqwest::header::HeaderName, &str)>) -> std::result::Result<Vec<u8>, Attempt> {
+    /// The body and whether the backend marked it fully transparent (`X-Empty-Image: 1`).
+    async fn request_once(&self, url: &str, affinity: Option<(&reqwest::header::HeaderName, &str)>) -> std::result::Result<(Vec<u8>, bool), Attempt> {
         let name = &self.conf.name;
         // Connect/reset errors are transient, timeouts are not (the render already took
         // client_timeout; repeating it only adds load).
@@ -280,6 +287,7 @@ impl WmsSource {
             .await
             .map_err(classify)?;
         let status = resp.status();
+        let empty = resp.headers().get("x-empty-image").is_some_and(|v| v.as_bytes() == b"1");
         let ctype = resp
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -295,7 +303,7 @@ impl WmsSource {
         if !ctype.starts_with("image/") {
             return Err(Attempt::Fatal(anyhow!("no image from {url} ({ctype}): {}", snippet())));
         }
-        Ok(body.to_vec())
+        Ok((body.to_vec(), empty))
     }
 }
 
@@ -448,6 +456,45 @@ mod tests {
         assert_eq!(seen.lock().unwrap().as_deref(), Some("lag06|52|1329"));
         src.request_once(&format!("http://{addr}/wms"), None).await.ok().unwrap();
         assert_eq!(seen.lock().unwrap().as_deref(), None, "no header when affinity is off");
+    }
+
+    /// `X-Empty-Image: 1` marks the response empty; any other value or no header doesn't.
+    #[tokio::test]
+    async fn request_reads_empty_image_header() {
+        use axum::{Router, extract::Query, routing::get};
+        use std::collections::HashMap;
+        let app = Router::new().route(
+            "/wms",
+            get(|Query(q): Query<HashMap<String, String>>| async move {
+                let mut h = vec![("content-type", "image/png".to_string())];
+                if let Some(v) = q.get("e") {
+                    h.push(("x-empty-image", v.clone()));
+                }
+                (axum::http::HeaderMap::from_iter(h.into_iter().map(|(k, v)| (k.parse().unwrap(), v.parse().unwrap()))), vec![0u8; 4])
+            }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        let conf = SourceConf {
+            name: "x".into(),
+            url: format!("http://{addr}/wms"),
+            params: vec![],
+            supported_srs: vec![],
+            min_res: None,
+            max_res: None,
+            coverage: None,
+            on_error_transparent: false,
+            client_timeout: 5.0,
+        };
+        let src = WmsSource::new(conf, reqwest::Client::new());
+        let empty = |q: &'static str| {
+            let src = &src;
+            async move { src.request_once(&format!("http://{addr}/wms{q}"), None).await.ok().unwrap().1 }
+        };
+        assert!(empty("?e=1").await);
+        assert!(!empty("?e=0").await);
+        assert!(!empty("").await);
     }
 
     #[test]
