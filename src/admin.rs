@@ -1,9 +1,7 @@
-//! `serve --admin`: the API behind the `/_admin` GUI (replaces tnt-mapproxy's Python admin). Seeds
-//! and cleanups run as `rmapproxy seed` children, one `--progress-file` per job; records in
-//! `<base_dir>/.rmapproxy-admin/` let stopped, failed or interrupted jobs continue. Other
-//! processes' `<base_dir>/.mapproxy_seed_progress.*` (SKIPJobs, tnt-mapproxy's admin) are listed
-//! read-only; history keeps `.seed_history.json`'s format. Seed jobs can instead go to `rmapproxy
-//! seed-worker` pods as chunks leased over `/_admin/work/*` (`work.rs`).
+//! `serve --admin`: the API behind the `/_admin` GUI. Seeds/cleanups run as `rmapproxy seed`
+//! children (one `--progress-file` each) or as chunks leased to `seed-worker` pods (`work.rs`);
+//! records in `<base_dir>/.rmapproxy-admin/` let stopped, failed or interrupted jobs continue.
+//! Other processes' `.mapproxy_seed_progress.*` files are listed read-only.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::os::unix::fs::MetadataExt;
@@ -1726,7 +1724,7 @@ impl Admin {
         }
     }
 
-    // ── legends (tnt-mapproxy's /legend/topo-<scale>.png) ──────────────────
+    // ── legends (/legend/topo-<scale>.png) ──────────────────────────────────
 
     async fn generate_legends(self: Arc<Self>, force: bool) {
         if self.legends_running.swap(true, Ordering::SeqCst) {
@@ -1913,7 +1911,7 @@ impl Job {
 }
 
 fn parse_iso(s: &str) -> Option<f64> {
-    // tnt-mapproxy wrote `2026-10-26T12:40:38.867573+00:00`, this module `…T12:40:38Z`.
+    // Older history (the Python admin) has `2026-10-26T12:40:38.867573+00:00`, this module `…Z`.
     let b = s.as_bytes();
     if b.len() < 19 {
         return None;

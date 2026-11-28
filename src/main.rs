@@ -1,4 +1,4 @@
-//! rMapproxy: the MapProxy features tnt-mapproxy uses, in Rust (see SCOPE.md).
+//! rMapproxy: a pixel-identical Rust reimplementation of a MapProxy subset (SCOPE.md).
 
 mod admin;
 mod cache;
@@ -77,8 +77,8 @@ fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "rmapproxy=info".into()))
         .init();
     let mut args: Vec<String> = std::env::args().skip(1).collect();
-    // Installed as `mapproxy-seed` (what tnt-mapproxy's admin app and seed jobs run and
-    // look for in /proc/<pid>/cmdline): act as `rmapproxy seed`.
+    // Called as `mapproxy-seed` (existing jobs/tools run it and spot seeds by that cmdline):
+    // act as `rmapproxy seed`.
     let argv0 = std::env::args().next().unwrap_or_default();
     if std::path::Path::new(&argv0).file_name().is_some_and(|n| n == "mapproxy-seed") {
         args.insert(0, "seed".into());

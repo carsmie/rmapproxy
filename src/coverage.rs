@@ -1,6 +1,6 @@
 //! Source/seed coverages (`util/coverage.py`, `config/coverage.py`): a bbox or GeoJSON polygons in
-//! their own SRS. Polygons stay raw, without MapProxy's 1e-6-of-extent simplification:
-//! tnt-mapproxy's are rectangles or seed-only.
+//! their own SRS. Polygons stay raw, without MapProxy's 1e-6-of-extent simplification (only
+//! matters for detailed polygons used as source coverages).
 
 use std::path::{Path, PathBuf};
 

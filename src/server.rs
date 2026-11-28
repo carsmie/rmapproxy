@@ -1,5 +1,5 @@
 //! WMTS 1.0.0 (`service/wmts.py`): KVP on /service, REST under /wmts/1.0.0, capabilities.
-//! Responses carry the headers tnt-mapproxy's WSGI wrapper adds (CORS) and MapProxy's
+//! Responses carry CORS headers (as a typical MapProxy WSGI wrapper adds them) and MapProxy's
 //! cache headers (`globals.tiles.expires_hours`).
 
 use std::collections::HashMap;
@@ -80,8 +80,8 @@ pub async fn shutdown_signal() {
     info!("shutting down");
 }
 
-/// tnt-mapproxy's `/legend/topo-<scale>.png`: files the admin app writes to
-/// MAPPROXY_LEGEND_DIR (default `<cache base_dir>/legend`).
+/// `/legend/topo-<scale>.png`: files `serve --admin` writes to MAPPROXY_LEGEND_DIR (default
+/// `<cache base_dir>/legend`).
 async fn legend(State(app): State<App>, Path(file): Path<String>) -> Response {
     // topo-<scale>.png, topo-<scale>@2x.png, topo-<scale>.json only (no path components).
     let kind = file.strip_prefix("topo-").and_then(|f| {

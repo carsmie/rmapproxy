@@ -12,11 +12,10 @@ use crate::pyfloat::int;
 use crate::srs::{BBox, Srs};
 use crate::transform::{mesh_warp, transform_meshes};
 
-/// Optional backend affinity: with RMAPPROXY_AFFINITY_HEADER set, every GetMap carries
-/// `<header>: <source>|<cx>|<cy>`, the bbox centre in RMAPPROXY_AFFINITY_CELL_M cells (default
-/// 5000 m). A mesh hashing on it (Istio consistentHash.httpHeaderName) sends the same layer and
-/// area to the same backend pod, which keeps that pod's data caches warm; one layer still
-/// spreads over many pods. Unset (default): no header.
+/// Optional backend affinity (off unless RMAPPROXY_AFFINITY_HEADER is set): every GetMap carries
+/// `<header>: <source>|<cx>|<cy>`, the bbox centre in RMAPPROXY_AFFINITY_CELL_M cells (5000 m), so
+/// a mesh hashing on it keeps one layer+area on one pod (warm caches). Concurrent neighbouring
+/// metatiles share a cell and pile onto that pod: size the cell against seed concurrency.
 struct Affinity {
     header: reqwest::header::HeaderName,
     cell_m: f64,
@@ -233,10 +232,8 @@ impl WmsSource {
         format!("{}{}{}", self.conf.url, sep, qs.join("&"))
     }
 
-    /// GetMap with retries on transient upstream failures (`RETRY_BACKOFF`): a dying backend pod
-    /// (OOMKill, rollout) fails its in-flight requests with 503/reset for seconds; Istio's
-    /// immediate retries hit the same dead endpoint.
-    /// `None`: the backend marked the image fully transparent (`X-Empty-Image: 1`).
+    /// GetMap, retried on transient failures (`RETRY_BACKOFF`: a dying backend pod fails in-flight
+    /// requests for seconds, immediate mesh retries hit the same pod). `None` = marked empty.
     async fn request(&self, bbox: BBox, size: (u32, u32), srs: &Srs) -> Result<Option<Vec<u8>>> {
         let url = self.getmap_url(bbox, size, srs);
         let affinity = AFFINITY.as_ref().map(|a| (&a.header, affinity_key(&self.conf.name, bbox, srs, a.cell_m)));

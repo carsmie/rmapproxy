@@ -1,5 +1,5 @@
-//! The subset of the MapProxy configuration tnt-mapproxy uses (see SCOPE.md), with
-//! MapProxy's defaults and `base:` merge semantics (`config/loader.py`).
+//! The supported subset of the MapProxy configuration (SCOPE.md), with MapProxy's defaults and
+//! `base:` merge semantics (`config/loader.py`).
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -317,8 +317,8 @@ impl Config {
             expires_hours: get(&v, &["globals", "tiles", "expires_hours"]).and_then(f64_of),
         };
 
-        // Only grids that caches use are built: others may be base-only templates
-        // (tnt-mapproxy's `utm` has no srs), which MapProxy never instantiates either.
+        // Only grids caches use are built: others may be base-only templates without an srs,
+        // which MapProxy never instantiates either.
         let empty = Mapping::new();
         let grid_map = v.get("grids").and_then(|g| g.as_mapping()).unwrap_or(&empty);
         let used: std::collections::BTreeSet<String> = v

@@ -1,5 +1,5 @@
-//! Just enough Python pickle (protocol 2) to write mapproxy-seed's `--progress-file`, which
-//! tnt-mapproxy's admin app reads with `pickle.load` (it only looks at the dict keys).
+//! Just enough Python pickle (protocol 2) for mapproxy-seed's `--progress-file`, so tools that
+//! `pickle.load` it (MapProxy-era admin apps read only the dict keys) keep working.
 
 pub enum Py {
     Str(String),

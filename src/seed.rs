@@ -1,7 +1,7 @@
 //! `mapproxy-seed` (`seed/seeder.py`, `seed/cleanup.py`, `seed/config.py`): depth-first
 //! TileWalker over metatiles intersecting the task coverage, refresh_before / overwrite-all,
 //! cleanups, N concurrent metatiles, progress lines in mapproxy-seed's format and the
-//! `--progress-file` pickle that tnt-mapproxy's admin app reads.
+//! `--progress-file` pickle MapProxy-era tools read.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -471,8 +471,8 @@ fn walk_tc(task: &SeedTask, z: usize, dir: &Path, parts: &mut Vec<i64>, n: &mut 
     Ok(())
 }
 
-/// `--progress-file`: the pickle tnt-mapproxy's admin reads (task-id keys) plus a JSON
-/// sidecar with the finished-prefix length per task, which `--continue` resumes from.
+/// `--progress-file`: mapproxy-seed's pickle (task-id keys) plus a JSON sidecar with each task's
+/// finished-prefix length, which `--continue` resumes from.
 pub struct Progress {
     path: PathBuf,
     done: BTreeMap<String, (usize, usize)>,
